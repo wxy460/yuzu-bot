@@ -1,0 +1,18 @@
+[Unit]
+Description=Maimai QQ Bot (official QQ Open Platform)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/maimai-bot
+EnvironmentFile=%h/.config/maimai-bot/env
+ExecStart=%h/.local/share/maimai-bot/.venv/bin/maimai-bot
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
