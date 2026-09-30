@@ -241,6 +241,26 @@ async def dice_command(request: CommandRequest) -> str:
 3. 为 service 使用 `httpx.MockTransport` 写测试，避免测试依赖真实网络；
 4. 密钥只新增到环境变量和 `.env.example`，不要写进源码。
 
+## 云服务器自动部署
+
+生产环境使用 `/opt/yuzu-bot/releases/<commit>` 保存相互隔离的发布版本，
+`/opt/yuzu-bot/current` 原子切换到最新版本。每次部署都会创建独立虚拟环境、
+运行完整测试并检查 systemd 服务；健康检查失败时自动切回上一个版本。
+
+GitHub Actions 只持有一把专用 SSH 私钥。服务器端对应公钥使用
+`restrict,command="/usr/local/sbin/deploy-yuzu-bot"` 限制，因此该密钥不能获得交互式
+Shell，也不能执行任意远程命令。工作流需要以下 Actions Secrets：
+
+- `DEPLOY_HOST`
+- `DEPLOY_PORT`
+- `DEPLOY_USER`
+- `DEPLOY_SSH_KEY`
+- `DEPLOY_KNOWN_HOSTS`
+
+真实环境变量保存在服务器 `/etc/yuzu-bot/env`，聊天记忆和用户收藏品选择保存在
+`/var/lib/yuzu-bot/`；这些文件不会进入 GitHub。推送 `main` 后，
+`.github/workflows/deploy.yml` 会通过受限 SSH 入口执行服务器上的部署脚本。
+
 如果将来要做图片版 B50，可在 `DivingFishService` 之上增加海报渲染 service，再调用官方 SDK 的图片上传接口；不需要改变 OAuth 和命令路由设计。
 
 ## 安全与限制

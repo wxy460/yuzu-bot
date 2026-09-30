@@ -23,12 +23,16 @@ logger = logging.getLogger(__name__)
 CANVAS_SIZE = (1600, 1900)
 FONT_CANDIDATES = (
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
 )
 BOLD_FONT_CANDIDATES = (
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
 )
 DIFFICULTY_COLORS = {

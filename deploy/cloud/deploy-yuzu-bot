@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 027
+
+readonly APP_NAME="yuzu-bot"
+readonly REPOSITORY="/opt/yuzu-bot/repository"
+readonly RELEASES="/opt/yuzu-bot/releases"
+readonly CURRENT="/opt/yuzu-bot/current"
+readonly STATE_DIR="/var/lib/yuzu-bot"
+readonly SERVICE="yuzu-bot.service"
+readonly LOCK_FILE="/run/lock/yuzu-bot-deploy.lock"
+
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  echo "A yuzu-bot deployment is already running." >&2
+  exit 1
+fi
+
+git -C "${REPOSITORY}" fetch --prune origin main
+commit="$(git -C "${REPOSITORY}" rev-parse --verify origin/main^{commit})"
+release="${RELEASES}/${commit}"
+previous="$(readlink -f "${CURRENT}" 2>/dev/null || true)"
+
+if [[ ! -d "${release}" ]]; then
+  temporary="${RELEASES}/.${commit}.tmp"
+  rm -rf -- "${temporary}"
+  install -d -m 0755 "${temporary}"
+  git -C "${REPOSITORY}" archive "${commit}" | tar -x -C "${temporary}"
+
+  python3 -m venv "${temporary}/.venv"
+  "${temporary}/.venv/bin/pip" install --disable-pip-version-check --upgrade pip
+  (
+    cd "${temporary}"
+    .venv/bin/pip install --disable-pip-version-check -e '.[dev]'
+  )
+
+  ln -s "${STATE_DIR}/chat_memory.json" "${temporary}/data/chat_memory.json"
+  ln -s "${STATE_DIR}/cosmetics.json" "${temporary}/data/cosmetics.json"
+
+  (
+    cd "${temporary}"
+    .venv/bin/python -m compileall -q src
+    .venv/bin/pytest -q
+  )
+
+  mv -- "${temporary}" "${release}"
+fi
+
+ln -sfn "${release}" "${CURRENT}.next"
+mv -Tf "${CURRENT}.next" "${CURRENT}"
+systemctl daemon-reload
+systemctl restart "${SERVICE}"
+sleep 3
+
+if ! systemctl is-active --quiet "${SERVICE}"; then
+  echo "Deployment ${commit} failed health check; rolling back." >&2
+  journalctl -u "${SERVICE}" -n 80 --no-pager >&2 || true
+  if [[ -n "${previous}" && -d "${previous}" ]]; then
+    ln -sfn "${previous}" "${CURRENT}.rollback"
+    mv -Tf "${CURRENT}.rollback" "${CURRENT}"
+    systemctl restart "${SERVICE}"
+  fi
+  exit 1
+fi
+
+echo "Deployed yuzu-bot ${commit}"
+systemctl --no-pager --full status "${SERVICE}" | sed -n '1,12p'
