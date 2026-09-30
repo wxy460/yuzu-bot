@@ -20,31 +20,35 @@ fi
 git -C "${REPOSITORY}" fetch --prune origin main
 commit="$(git -C "${REPOSITORY}" rev-parse --verify origin/main^{commit})"
 release="${RELEASES}/${commit}"
-previous="$(readlink -f "${CURRENT}" 2>/dev/null || true)"
+previous=""
+if [[ -L "${CURRENT}" ]]; then
+  previous="$(readlink -f "${CURRENT}" 2>/dev/null || true)"
+fi
 
 if [[ ! -d "${release}" ]]; then
   temporary="${RELEASES}/.${commit}.tmp"
   rm -rf -- "${temporary}"
   install -d -m 0755 "${temporary}"
   git -C "${REPOSITORY}" archive "${commit}" | tar -x -C "${temporary}"
+  mv -- "${temporary}" "${release}"
+  trap 'rm -rf -- "${release}"' ERR
 
-  python3 -m venv "${temporary}/.venv"
-  "${temporary}/.venv/bin/pip" install --disable-pip-version-check --upgrade pip
+  python3 -m venv "${release}/.venv"
+  "${release}/.venv/bin/pip" install --disable-pip-version-check --upgrade pip
   (
-    cd "${temporary}"
+    cd "${release}"
     .venv/bin/pip install --disable-pip-version-check -e '.[dev]'
   )
 
-  ln -s "${STATE_DIR}/chat_memory.json" "${temporary}/data/chat_memory.json"
-  ln -s "${STATE_DIR}/cosmetics.json" "${temporary}/data/cosmetics.json"
+  ln -s "${STATE_DIR}/chat_memory.json" "${release}/data/chat_memory.json"
+  ln -s "${STATE_DIR}/cosmetics.json" "${release}/data/cosmetics.json"
 
   (
-    cd "${temporary}"
+    cd "${release}"
     .venv/bin/python -m compileall -q src
     .venv/bin/pytest -q
   )
-
-  mv -- "${temporary}" "${release}"
+  trap - ERR
 fi
 
 ln -sfn "${release}" "${CURRENT}.next"
