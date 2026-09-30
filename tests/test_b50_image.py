@@ -130,6 +130,7 @@ async def test_render_single_song_detail_png() -> None:
             difficulty=index,
             level=("6", "9", "12+", "14+", "15")[index],
             constant=(6.0, 9.0, 12.7, 14.8, 15.0)[index],
+            fit_constant=(6.03, None, 12.74, 14.72, 14.91)[index],
             designer="谱师",
             tap=300,
             hold=40,

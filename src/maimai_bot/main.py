@@ -75,6 +75,7 @@ async def run() -> None:
             http=http,
             handler=router.dispatch,
             panel_commands=router.commands,
+            unmentioned_group_filter=router.recognizes_command,
         )
         await adapter.run(stop_event)
 

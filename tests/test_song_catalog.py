@@ -105,3 +105,91 @@ async def test_catalog_attaches_divingfish_fitted_constant() -> None:
 
     assert songs[0].charts[0].fit_constant == 14.23
     assert songs[1].charts[0].fit_constant == 12.81
+
+
+async def test_random_chart_supports_combined_ranges() -> None:
+    payload = {
+        "songs": [
+            {
+                "id": 301,
+                "title": "PiNK Master",
+                "artist": "Artist",
+                "genre": "maimai",
+                "bpm": 180,
+                "version": 11000,
+                "difficulties": {
+                    "standard": [],
+                    "dx": [
+                        {
+                            "difficulty": 3,
+                            "level": "14",
+                            "level_value": 14.2,
+                            "version": 11000,
+                        }
+                    ],
+                },
+            },
+            {
+                "id": 302,
+                "title": "MURASAKi Master",
+                "artist": "Artist",
+                "genre": "maimai",
+                "bpm": 190,
+                "version": 12000,
+                "difficulties": {
+                    "standard": [],
+                    "dx": [
+                        {
+                            "difficulty": 3,
+                            "level": "14+",
+                            "level_value": 14.6,
+                            "version": 12000,
+                        }
+                    ],
+                },
+            },
+            {
+                "id": 303,
+                "title": "Current Expert",
+                "artist": "Artist",
+                "genre": "maimai",
+                "bpm": 160,
+                "version": 25000,
+                "difficulties": {
+                    "standard": [
+                        {
+                            "difficulty": 2,
+                            "level": "13+",
+                            "level_value": 13.7,
+                            "version": 25000,
+                        }
+                    ],
+                    "dx": [],
+                },
+            },
+        ],
+        "versions": [
+            {"title": "PiNK", "version": 11000},
+            {"title": "MURASAKi", "version": 12000},
+            {"title": "舞萌DX 2025", "version": 25000},
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/alias/list"):
+            return httpx.Response(200, json={"aliases": []})
+        if request.url.path.endswith("/chart_stats"):
+            return httpx.Response(200, json={"charts": {}})
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        catalog = SongCatalogService(client)
+        low = await catalog.random_chart("dx master 14.0-14.3 桃-紫")
+        high = await catalog.random_chart("dx master 14.5-14.8 桃-紫")
+        level = await catalog.random_chart("standard expert 13+-14+")
+        current = await catalog.random_chart("新曲 standard expert")
+
+    assert low.song_id == 301
+    assert high.song_id == 302
+    assert level.song_id == 303
+    assert current.song_id == 303

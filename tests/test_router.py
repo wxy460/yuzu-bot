@@ -63,3 +63,23 @@ async def test_unknown_command_has_hint() -> None:
 
     router = CommandRouter(fallback)
     assert "/help" in await router.dispatch(context("/missing"))
+
+
+def test_recognizes_commands_for_qq_full_group_messages() -> None:
+    async def fallback(message: MessageContext) -> str:
+        return message.content
+
+    router = CommandRouter(fallback)
+
+    @router.command("song", "test", aliases=("查歌",))
+    async def song(request):
+        return request.argument
+
+    router.pattern(r"^(.+)是什么歌$", "song", lambda match: match.group(1))
+
+    assert router.recognizes_command("/song 潘")
+    assert router.recognizes_command("查歌 潘")
+    assert router.recognizes_command("11451是什么歌")
+    assert router.recognizes_command("/missing")
+    assert not router.recognizes_command("大家晚上好")
+    assert not router.recognizes_command("")

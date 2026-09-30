@@ -1,5 +1,5 @@
 from maimai_bot.domain import BotReply, MessageContext
-from maimai_bot.features import HELP_SITE_URL, build_router
+from maimai_bot.features import COSMETIC_SITE_URL, HELP_SITE_URL, _cosmetic_help, build_router
 
 
 class HelpImageStub:
@@ -26,6 +26,12 @@ async def test_help_returns_preview_image_and_site_link() -> None:
     assert reply.image_png == b"preview-png"
     assert HELP_SITE_URL in reply.followup_text
     assert "网络代理" in reply.followup_text
+    assert [action.command for action in reply.quick_actions] == [
+        "/b50",
+        "/daily",
+        "/song ",
+        "/cosmetic",
+    ]
     assert images.command_count == len(router.commands)
 
 
@@ -39,3 +45,10 @@ async def test_categorized_help_remains_text_only() -> None:
     assert isinstance(reply, str)
     assert "【成绩】" in reply
     assert images.command_count == 0
+
+
+def test_cosmetic_help_links_to_searchable_catalog() -> None:
+    text = _cosmetic_help(None, None)
+
+    assert COSMETIC_SITE_URL in text
+    assert "点击复制 ID" in text

@@ -110,6 +110,23 @@ class CommandRouter:
                 )
         return await self._fallback(context)
 
+    def recognizes_command(self, content: str) -> bool:
+        """Return whether plain text should be treated as a bot command.
+
+        QQ's ``GROUP_MESSAGE_CREATE`` event contains every message in a group.
+        The transport uses this check to keep no-mention commands working
+        without turning ordinary group conversation into LLM prompts.
+        """
+        text = content.strip()
+        if not text:
+            return False
+        if text.startswith("/"):
+            return True
+        head, _, _ = text.partition(" ")
+        if head.casefold() in self._lookup:
+            return True
+        return any(route.regex.fullmatch(text) for route in self._patterns)
+
     async def _dispatch_named(
         self,
         context: MessageContext,

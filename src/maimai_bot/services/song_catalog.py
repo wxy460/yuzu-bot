@@ -268,7 +268,30 @@ class SongCatalogService:
         title_words: list[str] = []
         current_version = max((song.version for song in songs), default=0)
         for word in words:
-            if word in TYPE_ALIASES:
+            level_range = re.fullmatch(
+                r"(\d{1,2}\+?)(?:-|~|～|至|到)(\d{1,2}\+?)",
+                word,
+            )
+            constant_range = re.fullmatch(
+                r"(\d+(?:\.\d+)?)(?:-|~|～|至|到)(\d+(?:\.\d+)?)",
+                word,
+            )
+            version_range = re.fullmatch(
+                r"([初真超檄橙暁晓桃櫻樱紫菫堇白雪輝辉熊華华爽煌宙星祭祝双宴镜鏡彩])"
+                r"(?:-|~|～|至|到)"
+                r"([初真超檄橙暁晓桃櫻樱紫菫堇白雪輝辉熊華华爽煌宙星祭祝双宴镜鏡彩])(?:代)?",
+                word,
+            )
+            if level_range:
+                low, high = sorted(_level_rank(value) for value in level_range.groups())
+                candidates = [chart for chart in candidates if low <= _level_rank(chart.level) <= high]
+            elif constant_range:
+                low, high = sorted(float(value) for value in constant_range.groups())
+                candidates = [chart for chart in candidates if low <= chart.constant <= high]
+            elif version_range:
+                low, high = self._version_range(*version_range.groups())
+                candidates = [chart for chart in candidates if low <= chart.version <= high]
+            elif word in TYPE_ALIASES:
                 chart_type = TYPE_ALIASES[word]
                 candidates = [chart for chart in candidates if chart.chart_type == chart_type]
             elif word in DIFFICULTY_ALIASES:
@@ -306,6 +329,18 @@ class SongCatalogService:
             raise SongCatalogError("没有符合条件的谱面，请减少筛选条件后重试。")
         return random.SystemRandom().choice(candidates)
 
+    def _version_range(self, start: str, end: str) -> tuple[int, int]:
+        def boundaries(mark: str) -> tuple[int, int]:
+            titles = PLATE_VERSION_ALIASES[mark]
+            ids = [version for version, title in self._versions.items() if title in titles]
+            if not ids:
+                raise SongCatalogError(f"曲目目录中无法识别版本「{mark}代」。")
+            return min(ids), max(ids)
+
+        start_low, start_high = boundaries(start)
+        end_low, end_high = boundaries(end)
+        return min(start_low, end_low), max(start_high, end_high)
+
     async def daily(self, user_id: str, day: date | None = None) -> Chart:
         songs = await self.songs()
         candidates = [chart for song in songs for chart in song.charts if chart.difficulty >= 2]
@@ -315,16 +350,26 @@ class SongCatalogService:
         digest = hashlib.sha256(f"{today.isoformat()}:{user_id}".encode()).digest()
         return candidates[int.from_bytes(digest[:8], "big") % len(candidates)]
 
-    async def cover_clue(self, song_id: int) -> bytes:
+    async def cover_clue(self, song_id: int, *, reveal_level: int = 0) -> bytes:
         try:
             raw = await download_lxns_png(self._http, "jacket", song_id)
             image = Image.open(io.BytesIO(raw)).convert("RGB")
-            side = max(40, min(image.width, image.height) // 4)
-            rng = random.SystemRandom()
-            left = rng.randrange(0, max(1, image.width - side + 1))
-            top = rng.randrange(0, max(1, image.height - side + 1))
-            clue = image.crop((left, top, left + side, top + side)).resize((480, 480))
-            clue = clue.filter(ImageFilter.GaussianBlur(radius=1.2))
+            ratios = (0.22, 0.36, 0.52, 0.72, 1.0)
+            level = max(0, min(reveal_level, len(ratios) - 1))
+            base_side = min(image.width, image.height)
+            side = max(40, round(base_side * ratios[level]))
+            digest = hashlib.sha256(f"cover-clue:{song_id}".encode()).digest()
+            center_x = image.width * (0.3 + digest[0] / 255 * 0.4)
+            center_y = image.height * (0.3 + digest[1] / 255 * 0.4)
+            left = round(max(0, min(image.width - side, center_x - side / 2)))
+            top = round(max(0, min(image.height - side, center_y - side / 2)))
+            clue = image.crop((left, top, left + side, top + side)).resize(
+                (480, 480),
+                Image.Resampling.LANCZOS,
+            )
+            blur_radius = (1.2, 0.8, 0.45, 0.15, 0.0)[level]
+            if blur_radius:
+                clue = clue.filter(ImageFilter.GaussianBlur(radius=blur_radius))
             output = io.BytesIO()
             clue.save(output, format="PNG")
             return output.getvalue()
@@ -350,7 +395,9 @@ def format_song(song: Song, version_name: str) -> str:
         "谱面：",
     ]
     rows.extend(
-        f"{chart.type_label} {chart.difficulty_name} {chart.level}（定数 {chart.constant:.1f}）"
+        f"{chart.type_label} {chart.difficulty_name} {chart.level}"
+        f"（定数 {chart.constant:.1f} / 拟合定数 "
+        f"{f'{chart.fit_constant:.2f}' if chart.fit_constant is not None else '—'}）"
         for chart in song.charts
     )
     return "\n".join(rows)
@@ -368,6 +415,13 @@ def format_chart(chart: Chart) -> str:
         f"{chart.type_label} {chart.difficulty_name} {chart.level} / 定数 {chart.constant:.1f}\n"
         f"谱师：{chart.designer or '未知'}　分类：{chart.genre}{notes}"
     )
+
+
+def _level_rank(level: str) -> int:
+    match = re.fullmatch(r"(\d{1,2})(\+?)", level.strip())
+    if match is None:
+        return -1
+    return int(match.group(1)) * 2 + bool(match.group(2))
 
 
 def _parse_song(item: dict[str, Any], fit_stats: dict[str, Any] | None = None) -> Song:

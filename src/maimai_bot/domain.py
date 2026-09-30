@@ -21,9 +21,20 @@ class CommandRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class QuickAction:
+    """A transport-neutral shortcut shown below a bot reply."""
+
+    label: str
+    command: str = ""
+    auto_send: bool = True
+    url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class BotReply:
     """A platform-neutral reply that may contain a rendered PNG."""
 
     text: str = ""
     image_png: bytes | None = None
     followup_text: str = ""
+    quick_actions: tuple[QuickAction, ...] = ()

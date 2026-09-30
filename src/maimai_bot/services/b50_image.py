@@ -700,15 +700,16 @@ class B50ImageService:
         draw.text((850, 400), version, font=_font(23, bold=True), fill="#4f496c")
 
         columns = (
-            ("难度 / 类型", 240),
-            ("定数", 110),
-            ("TOTAL", 110),
-            ("TAP", 100),
-            ("HOLD", 100),
-            ("SLIDE", 100),
-            ("TOUCH", 100),
-            ("BREAK", 100),
-            ("谱师", 300),
+            ("难度 / 类型", 210),
+            ("定数", 100),
+            ("拟合定数", 110),
+            ("TOTAL", 100),
+            ("TAP", 90),
+            ("HOLD", 90),
+            ("SLIDE", 90),
+            ("TOUCH", 90),
+            ("BREAK", 90),
+            ("谱师", 290),
         )
         self._draw_song_table(
             draw,
@@ -927,7 +928,11 @@ class B50ImageService:
             accent = DIFFICULTY_COLORS.get(chart.difficulty, "#9852d9")
             if index:
                 draw.line((left, y, right, y), fill="#53ddd3", width=3)
-            draw.rectangle((left + 3, y, left + 239, y + row_h), fill=accent)
+            first_column_width = columns[0][1]
+            draw.rectangle(
+                (left + 3, y, left + first_column_width - 1, y + row_h),
+                fill=accent,
+            )
             draw.text(
                 (left + 18, y + 11), chart.difficulty_name, font=_font(21, bold=True), fill="white"
             )
@@ -937,10 +942,11 @@ class B50ImageService:
             type_asset = "dx" if chart.chart_type == "dx" else "standard"
             badge = _badge_image(self._type_path / f"{type_asset}.webp", (72, 24))
             if badge:
-                overlay.alpha_composite(badge, (left + 150, y + 51))
+                overlay.alpha_composite(badge, (left + 126, y + 51))
 
             values = (
                 f"{chart.constant:.1f}",
+                f"{chart.fit_constant:.2f}" if chart.fit_constant is not None else "—",
                 str(chart.note_count),
                 str(chart.tap),
                 str(chart.hold),
@@ -949,7 +955,7 @@ class B50ImageService:
                 str(chart.break_count),
             )
             x = left + columns[0][1]
-            for value, (_, width) in zip(values, columns[1:8], strict=True):
+            for value, (_, width) in zip(values, columns[1:-1], strict=True):
                 value_font = _font(24, bold=True)
                 value_width = draw.textlength(value, font=value_font)
                 draw.text(

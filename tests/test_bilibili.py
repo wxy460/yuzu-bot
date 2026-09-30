@@ -63,6 +63,26 @@ async def test_confirmation_links_are_direct_bv_urls_and_verify_chart_type() -> 
     assert "search.bilibili.com" not in text
 
 
+async def test_confirmation_result_exposes_structured_chart_links() -> None:
+    song = Song(
+        1628,
+        "WE'RE BACK!!",
+        "K-forest",
+        "maimai",
+        180,
+        23000,
+        (_chart("dx", 3), _chart("standard", 4)),
+    )
+    async with httpx.AsyncClient() as client:
+        result = await StubBilibiliService(client).confirmations(song)
+
+    assert [(item.chart.chart_type, item.chart.difficulty) for item in result.entries] == [
+        ("dx", 3),
+        ("standard", 4),
+    ]
+    assert result.entries[0].video is not None
+
+
 async def test_confirmation_links_are_empty_without_purple_or_white_chart() -> None:
     song = Song(1, "Only Expert", "Artist", "maimai", 120, 23000, (_chart("dx", 2),))
     async with httpx.AsyncClient() as client:

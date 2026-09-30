@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import random
 import re
 import time
+from dataclasses import dataclass
+from urllib.parse import urlencode
 
-from .domain import BotReply, CommandRequest, MessageContext
+from .domain import BotReply, CommandRequest, MessageContext, QuickAction
+from .qq_shortcuts import COSMETIC_QUICK_ACTIONS, HELP_QUICK_ACTIONS
 from .router import CommandRouter
 from .services.b50_image import B50ImageService, B50RenderError
-from .services.bilibili import BilibiliChartService
+from .services.bilibili import BilibiliChartService, ChartConfirmationResult, chart_label
 from .services.chart_analysis import ChartAnalysisService
 from .services.chat import ChatService, ChatUnavailable
 from .services.cosmetics import CollectionItem, CosmeticError, CosmeticKind, CosmeticService
@@ -39,6 +44,8 @@ from .services.gameplay import (
 )
 from .services.rating import minimum_achievement, rating_for
 from .services.song_catalog import (
+    Chart,
+    Song,
     SongCatalogError,
     SongCatalogService,
     format_chart,
@@ -47,6 +54,24 @@ from .services.song_catalog import (
 
 logger = logging.getLogger(__name__)
 HELP_SITE_URL = "https://fujisawa-yuzu-maimai-bot.chummy-chick-1306.chatgpt.site"
+COSMETIC_SITE_URL = f"{HELP_SITE_URL}#cosmetics"
+
+
+@dataclass(slots=True)
+class GuessSession:
+    song_id: int
+    title: str
+    aliases: tuple[str, ...]
+    song: Song | None
+    initial_clue: str
+    hints: tuple[GuessHint, ...]
+    hint_index: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class GuessHint:
+    text: str
+    cover_level: int | None = None
 
 
 def build_router(
@@ -59,7 +84,24 @@ def build_router(
     bilibili: BilibiliChartService,
 ) -> CommandRouter:
     score_context_cache: dict[str, tuple[float, PlayerRecords]] = {}
-    guess_sessions: dict[str, tuple[int, str, tuple[str, ...]]] = {}
+    guess_sessions: dict[str, GuessSession] = {}
+
+    async def guess_answer_reply(session: GuessSession, lead: str) -> str | BotReply:
+        if session.song is None:
+            return f"{lead} {session.title}（ID {session.song_id}）。"
+        version_name = catalog.version_name(session.song.version)
+        details = format_song(session.song, version_name)
+        text = f"{lead} {session.title}（ID {session.song_id}）。\n\n{details}"
+        try:
+            image_png = await b50_images.render_song_info(
+                session.song,
+                version_name,
+                headline="猜歌答案",
+            )
+        except B50RenderError as exc:
+            logger.warning("guess answer image render failed: %s", exc)
+            return text + f"\n\n歌曲详情图生成失败，已返回文字信息：{exc}"
+        return BotReply(text=text, image_png=image_png)
 
     async def chat_fallback(context: MessageContext) -> str:
         if not context.content.strip():
@@ -68,6 +110,7 @@ def build_router(
         try:
             score_context = await _chat_score_context(
                 scores,
+                catalog,
                 score_context_cache,
                 context.user_id,
                 context.content,
@@ -100,6 +143,19 @@ def build_router(
             image_png=image_png,
         )
 
+    def quick_reply(
+        reply: str | BotReply,
+        actions: tuple[QuickAction, ...],
+    ) -> BotReply:
+        if isinstance(reply, BotReply):
+            return BotReply(
+                text=reply.text,
+                image_png=reply.image_png,
+                followup_text=reply.followup_text,
+                quick_actions=actions,
+            )
+        return BotReply(text=reply, quick_actions=actions)
+
     @router.command(
         "help", "查看完整命令列表", aliases=("帮助", "菜单"), category="常用", usage="/help [分类]"
     )
@@ -121,6 +177,7 @@ def build_router(
             text="舞萌 Bot 指令菜单预览",
             image_png=image_png,
             followup_text=site_message,
+            quick_actions=HELP_QUICK_ACTIONS,
         )
 
     @router.command("ping", "检查机器人是否在线", category="设置")
@@ -161,6 +218,7 @@ def build_router(
         try:
             score_context = await _chat_score_context(
                 scores,
+                catalog,
                 score_context_cache,
                 context.user_id,
                 request.argument,
@@ -406,14 +464,22 @@ def build_router(
             song = exact[0] if exact else matches[0]
             version_name = catalog.version_name(song.version)
             text = format_song(song, version_name)
-            confirmation = await bilibili.confirmation_links(song)
+            confirmations = await bilibili.confirmations(song)
+            resources, resource_actions = _song_resources(confirmations)
             try:
                 image_png = await b50_images.render_song_info(song, version_name)
             except B50RenderError as exc:
                 logger.warning("song detail image render failed: %s", exc)
                 fallback = text + f"\n\n图片生成失败，已回退到文字版：{exc}"
-                return fallback + (f"\n\n{confirmation}" if confirmation else "")
-            return BotReply(text=text, image_png=image_png, followup_text=confirmation)
+                if resources:
+                    fallback += f"\n\n{resources}"
+                return BotReply(text=fallback, quick_actions=resource_actions)
+            return BotReply(
+                text=text,
+                image_png=image_png,
+                followup_text=resources,
+                quick_actions=resource_actions,
+            )
         rows = [f"找到 {len(matches)} 个候选（发送 /song ID 查看详情）："]
         rows.extend(f"{song.id} — {song.title} / {song.artist}" for song in matches)
         entries = [_song_list_record(song) for song in matches[:20]]
@@ -756,27 +822,32 @@ def build_router(
 
     @router.command(
         "guess",
-        "开始曲绘、谱面、Note 或首字母猜歌",
+        "按定数、版本、难度或谱面类型开始猜歌",
         aliases=("猜歌",),
         category="娱乐",
-        usage="猜歌 / 曲绘猜歌 / 谱面猜歌 / note猜歌 / 开字母",
+        usage="猜歌 [14.0-14.5] [桃-紫] [DX] / 曲绘猜歌 14+",
     )
     async def guess_command(request: CommandRequest) -> str | BotReply:
-        mode = request.argument.casefold() or "normal"
+        if request.argument.strip().casefold() in {"help", "帮助", "用法"}:
+            return _guess_help_text()
+        mode, filters = _parse_guess_request(request.argument)
+        chart_query = _guess_chart_query(filters)
         try:
-            chart = await catalog.random_chart("master")
+            chart = await catalog.random_chart(chart_query)
             aliases = (await catalog.aliases_for(str(chart.song_id)) or (None, ()))[1]
+            song = next(
+                (item for item in await catalog.songs() if item.id == chart.song_id),
+                None,
+            )
         except SongCatalogError as exc:
             return str(exc)
-        key = f"{request.context.chat_scope}:{request.context.chat_id}"
-        guess_sessions[key] = (chart.song_id, chart.title, aliases)
         if mode == "cover":
             try:
-                image = await catalog.cover_clue(chart.song_id)
+                image = await catalog.cover_clue(chart.song_id, reveal_level=0)
             except SongCatalogError as exc:
                 return str(exc)
-            return BotReply(text="曲绘猜歌开始！发送「答 曲名/别名/ID」作答。", image_png=image)
-        if mode == "chart":
+            clue = "局部曲绘"
+        elif mode == "chart":
             clue = f"谱师：{chart.designer or '未知'}；{chart.type_label} {chart.level}；物量 {chart.note_count or '未知'}"
         elif mode == "note":
             clue = f"TAP {chart.tap} / HOLD {chart.hold} / SLIDE {chart.slide} / TOUCH {chart.touch} / BREAK {chart.break_count}"
@@ -787,41 +858,86 @@ def build_router(
             if clue.endswith("："):
                 clue += chart.title[0]
         else:
-            clue = f"艺术家：{chart.artist}；分类：{chart.genre}；BPM/版本信息请用一次「提示」查看"
-        return f"猜歌开始！\n{clue}\n发送「答 曲名/别名/ID」作答，或发送「提示」「答案」。"
+            mode = "normal"
+            clue = f"艺术家：{chart.artist}；分类：{chart.genre}"
+        key = f"{request.context.chat_scope}:{request.context.chat_id}"
+        guess_sessions[key] = GuessSession(
+            song_id=chart.song_id,
+            title=chart.title,
+            aliases=aliases,
+            song=song,
+            initial_clue=clue,
+            hints=_build_guess_hints(
+                mode,
+                chart,
+                bpm=song.bpm if song is not None else 0,
+                version_name=catalog.version_name(chart.version),
+                filters=filters,
+            ),
+        )
+        if mode == "cover":
+            return BotReply(
+                text=(
+                    "曲绘猜歌开始！"
+                    + (f"\n限定范围：{filters}" if filters else "")
+                    + "\n提示可以多次使用，发送「答 曲名/别名/ID」作答。"
+                ),
+                image_png=image,
+            )
+        scope = f"\n限定范围：{filters}" if filters else ""
+        return f"猜歌开始！{scope}\n{clue}\n发送「答 曲名/别名/ID」作答，或发送「提示」「答案」。"
 
     @router.command("answer", "回答当前猜歌", aliases=("答",), category="娱乐", usage="答 曲名")
-    async def answer_command(request: CommandRequest) -> str:
+    async def answer_command(request: CommandRequest) -> str | BotReply:
         key = f"{request.context.chat_scope}:{request.context.chat_id}"
         current = guess_sessions.get(key)
         if current is None:
             return "当前会话没有正在进行的猜歌。发送「猜歌」开始。"
-        song_id, title, aliases = current
         answer = _normalize_text(request.argument)
         accepted = {
-            str(song_id),
-            _normalize_text(title),
-            *(_normalize_text(item) for item in aliases),
+            str(current.song_id),
+            _normalize_text(current.title),
+            *(_normalize_text(item) for item in current.aliases),
         }
         if answer in accepted:
             guess_sessions.pop(key, None)
-            return f"答对啦！答案是 {title}（ID {song_id}）。"
+            return await guess_answer_reply(current, "答对啦！答案是")
         return "还不对，再想想看；也可以发送「提示」或「答案」。"
 
     @router.command("hint", "获取当前猜歌提示", aliases=("提示",), category="娱乐")
-    async def hint_command(request: CommandRequest) -> str:
+    async def hint_command(request: CommandRequest) -> str | BotReply:
         key = f"{request.context.chat_scope}:{request.context.chat_id}"
         current = guess_sessions.get(key)
         if current is None:
             return "当前没有猜歌题目。"
-        _, title, _ = current
-        return f"提示：歌名共 {len(title)} 个字符，开头是「{title[0]}」。"
+        if current.hint_index >= len(current.hints):
+            return (
+                "这道题的增量提示已经全部给出啦。\n"
+                + _format_guess_hints(current)
+                + "\n还猜不到可以发送「答案」。"
+            )
+        hint = current.hints[current.hint_index]
+        current.hint_index += 1
+        text = _format_guess_hints(current)
+        if hint.cover_level is None:
+            return text
+        try:
+            image = await catalog.cover_clue(
+                current.song_id,
+                reveal_level=hint.cover_level,
+            )
+        except SongCatalogError as exc:
+            logger.warning("progressive cover clue failed: %s", exc)
+            return text + "\n曲绘扩大提示生成失败，本次仍保留文字提示。"
+        return BotReply(text=text, image_png=image)
 
     @router.command("reveal", "公布当前猜歌答案", aliases=("答案",), category="娱乐")
-    async def reveal_command(request: CommandRequest) -> str:
+    async def reveal_command(request: CommandRequest) -> str | BotReply:
         key = f"{request.context.chat_scope}:{request.context.chat_id}"
         current = guess_sessions.pop(key, None)
-        return f"答案是 {current[1]}（ID {current[0]}）。" if current else "当前没有猜歌题目。"
+        if current is None:
+            return "当前没有猜歌题目。"
+        return await guess_answer_reply(current, "答案是")
 
     @router.command(
         "listen-guess", "听歌猜曲（等待合法试听音源）", aliases=("听歌猜曲",), category="娱乐"
@@ -860,16 +976,22 @@ def build_router(
                         }
                         for item, asset in zip(items, assets, strict=True)
                     ]
-                    return await list_reply(
-                        f"{_kind_label(kind)}搜索｜{parts[2]}",
-                        entries,
-                        _format_search(kind, items),
-                        subtitle=f"发送 /cosmetic {_kind_label(kind)} ID 选择",
+                    return quick_reply(
+                        await list_reply(
+                            f"{_kind_label(kind)}搜索｜{parts[2]}",
+                            entries,
+                            _format_search(kind, items),
+                            subtitle=f"发送 /cosmetic {_kind_label(kind)} ID 选择",
+                        ),
+                        COSMETIC_QUICK_ACTIONS,
                     )
-            return await _handle_cosmetic_command(
-                cosmetics,
-                request.context.user_id,
-                request.argument,
+            return quick_reply(
+                await _handle_cosmetic_command(
+                    cosmetics,
+                    request.context.user_id,
+                    request.argument,
+                ),
+                COSMETIC_QUICK_ACTIONS,
             )
         except CosmeticError as exc:
             logger.warning("cosmetic command failed: %s", exc)
@@ -903,11 +1025,255 @@ def build_router(
         lambda m: m.group(1),
     )
     router.pattern(r"^(\d+(?:\.\d+)?)%?怎么打[？?]?$", "reverse", lambda m: m.group(1))
-    router.pattern(r"^曲绘猜歌$", "guess", lambda _: "cover")
-    router.pattern(r"^谱面猜歌$", "guess", lambda _: "chart")
-    router.pattern(r"^(?:note音?|音符)猜歌$", "guess", lambda _: "note")
-    router.pattern(r"^开字母(?:猜歌)?$", "guess", lambda _: "letter")
+    router.pattern(
+        r"^曲绘猜歌(?:\s+(.+))?$",
+        "guess",
+        lambda match: _mode_pattern_argument("cover", match.group(1)),
+    )
+    router.pattern(
+        r"^谱面猜歌(?:\s+(.+))?$",
+        "guess",
+        lambda match: _mode_pattern_argument("chart", match.group(1)),
+    )
+    router.pattern(
+        r"^(?:note音?|音符)猜歌(?:\s+(.+))?$",
+        "guess",
+        lambda match: _mode_pattern_argument("note", match.group(1)),
+    )
+    router.pattern(
+        r"^开字母(?:猜歌)?(?:\s+(.+))?$",
+        "guess",
+        lambda match: _mode_pattern_argument("letter", match.group(1)),
+    )
     return router
+
+
+_GUESS_MODES = {
+    "cover": "cover",
+    "曲绘": "cover",
+    "chart": "chart",
+    "谱面": "chart",
+    "note": "note",
+    "音符": "note",
+    "letter": "letter",
+    "字母": "letter",
+}
+_GUESS_DIFFICULTY_PATTERN = re.compile(
+    r"^(?:绿|黄|红|紫|白|basic|advanced|expert|master|mas|remaster|re:master|remas)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_guess_request(argument: str) -> tuple[str, str]:
+    tokens = argument.strip().split()
+    if not tokens:
+        return "normal", ""
+    mode = _GUESS_MODES.get(tokens[0].casefold())
+    if mode is None:
+        return "normal", " ".join(tokens)
+    return mode, " ".join(tokens[1:])
+
+
+def _guess_chart_query(filters: str) -> str:
+    words = filters.split()
+    if any(_GUESS_DIFFICULTY_PATTERN.fullmatch(word) for word in words):
+        return filters
+    return f"master {filters}".strip()
+
+
+def _mode_pattern_argument(mode: str, filters: str | None) -> str:
+    return f"{mode} {filters or ''}".strip()
+
+
+def _guess_help_text() -> str:
+    return (
+        "猜歌限定范围用法（条件可以叠加）：\n"
+        "• 猜歌 14.0-14.5\n"
+        "• 猜歌 桃-紫 DX\n"
+        "• 猜歌 13+-14+ 白 SD\n"
+        "• 曲绘猜歌 当前版本 14+\n"
+        "• 谱面猜歌 宴\n"
+        "• note猜歌 14.2 紫 DX\n"
+        "• 开字母 橙代 MASTER\n\n"
+        "可限定：精确定数/定数区间、等级/等级区间、版本/版本区间、"
+        "当前版本、DX/SD、绿黄红紫白难度。未指定难度时默认 MASTER。"
+    )
+
+
+def _build_guess_hints(
+    mode: str,
+    chart: Chart,
+    *,
+    bpm: int,
+    version_name: str,
+    filters: str = "",
+) -> tuple[GuessHint, ...]:
+    title_chars = [character for character in chart.title if not character.isspace()]
+    edge = (
+        f"歌名有 {len(title_chars)} 个非空格字符，首尾是「{title_chars[0]}…{title_chars[-1]}」"
+        if len(title_chars) > 1
+        else f"歌名非常短，只有 {len(title_chars)} 个字符"
+    )
+    known = _guess_known_aspects(filters)
+    known.update(
+        {
+            "normal": {"artist", "genre"},
+            "chart": {"designer", "type", "level", "notes"},
+            "note": {"notes"},
+            "letter": {"initials"},
+        }.get(mode, set())
+    )
+    clues = {
+        "artist": f"这首歌的艺术家是 {chart.artist}。",
+        "genre": f"它在游戏中的分类是「{chart.genre}」。",
+        "version": f"它初次收录于 {version_name}。",
+        "tempo_band": _tempo_band_hint(bpm),
+        "bpm": f"更明确一点：歌曲 BPM 是 {bpm}。" if bpm else "歌曲 BPM 暂无数据。",
+        "type": f"目标谱面属于{chart.type_label}谱面。",
+        "level": f"目标谱面的游戏内等级是 {chart.level}。",
+        "constant": f"目标谱面的定数是 {chart.constant:.1f}。",
+        "designer": f"这张谱面的谱师是 {chart.designer or '未知'}。",
+        "note_style": _note_style_hint(chart),
+        "title_style": _title_style_hint(chart.title),
+        "initials": f"标题轮廓：{_guess_title_initials(chart.title)}。",
+        "edge": edge,
+        "mask": f"最后给出部分歌名：{_masked_guess_title(chart.title)}",
+    }
+    tiers = (
+        ["genre", "version", "tempo_band", "type", "title_style"],
+        ["artist", "designer", "note_style", "bpm", "level", "constant"],
+        ["initials", "edge", "mask"],
+    )
+    seed = int.from_bytes(
+        hashlib.sha256(f"{chart.song_id}:{mode}:{filters}".encode()).digest()[:8],
+        "big",
+    )
+    rng = random.Random(seed)
+    selected: list[list[GuessHint]] = []
+    for index, names in enumerate(tiers):
+        available = [GuessHint(clues[name]) for name in names if name not in known]
+        rng.shuffle(available)
+        selected.append(available[:2] if index < 2 else available)
+    weak, medium, strong = selected
+    if mode == "cover":
+        text_hints = weak + medium + strong
+        progressive: list[GuessHint] = []
+        for level in range(1, 5):
+            progressive.append(
+                GuessHint(
+                    f"曲绘可见范围第 {level} 次扩大。",
+                    cover_level=level,
+                )
+            )
+            if text_hints:
+                progressive.append(text_hints.pop(0))
+        progressive.extend(text_hints)
+        return tuple(progressive)
+    return tuple(weak + medium + strong)
+
+
+def _guess_known_aspects(filters: str) -> set[str]:
+    known = {"difficulty"}
+    for word in filters.casefold().split():
+        if word in {"dx", "sd", "standard", "标准"}:
+            known.add("type")
+        if _GUESS_DIFFICULTY_PATTERN.fullmatch(word):
+            known.add("difficulty")
+        if word in {"新曲", "当前版本", "new"} or re.fullmatch(
+            r"[初真超檄橙暁晓桃櫻樱紫菫堇白雪輝辉熊華华爽煌宙星祭祝双宴镜鏡彩](?:代)?",
+            word,
+        ) or re.fullmatch(
+            r"[初真超檄橙暁晓桃櫻樱紫菫堇白雪輝辉熊華华爽煌宙星祭祝双宴镜鏡彩]"
+            r"(?:-|~|～|至|到)"
+            r"[初真超檄橙暁晓桃櫻樱紫菫堇白雪輝辉熊華华爽煌宙星祭祝双宴镜鏡彩](?:代)?",
+            word,
+        ):
+            known.add("version")
+        if re.fullmatch(r"\d{1,2}\+?", word) or re.fullmatch(
+            r"\d{1,2}\+?(?:-|~|～|至|到)\d{1,2}\+?",
+            word,
+        ):
+            known.update(("level", "constant"))
+        if re.fullmatch(r"\d+(?:\.\d+)", word) or re.fullmatch(
+            r"\d+(?:\.\d+)?(?:-|~|～|至|到)\d+(?:\.\d+)?",
+            word,
+        ):
+            known.update(("level", "constant"))
+    return known
+
+
+def _tempo_band_hint(bpm: int) -> str:
+    if not bpm:
+        return "这首歌的速度数据暂时未知。"
+    if bpm < 120:
+        feel = "偏舒缓"
+    elif bpm < 160:
+        feel = "中速"
+    elif bpm < 200:
+        feel = "偏快"
+    else:
+        feel = "高速"
+    return f"从体感速度看，它属于{feel}曲目。"
+
+
+def _note_style_hint(chart: Chart) -> str:
+    total = max(chart.note_count, 1)
+    traits: list[str] = []
+    if chart.touch:
+        traits.append("包含 TOUCH")
+    if chart.break_count / total >= 0.025:
+        traits.append("BREAK 比较显眼")
+    if chart.slide / total >= 0.12:
+        traits.append("SLIDE 占比较高")
+    if chart.note_count >= 900:
+        traits.append("整体物量很大")
+    elif chart.note_count and chart.note_count <= 500:
+        traits.append("整体物量不高")
+    if not traits:
+        traits.append("键型构成比较均衡")
+    return "谱面手感线索：" + "、".join(traits[:2]) + "。"
+
+
+def _title_style_hint(title: str) -> str:
+    latin_words = re.findall(r"[A-Za-z0-9]+", title)
+    cjk_count = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff]", title))
+    if latin_words and not cjk_count:
+        return f"歌名是英文/拉丁字母标题，共 {len(latin_words)} 个词。"
+    if cjk_count and not latin_words:
+        return "歌名主要由中文或日文字符组成。"
+    return "歌名是拉丁字母与中日文混合标题。"
+
+
+def _guess_title_initials(title: str) -> str:
+    words = re.findall(r"[A-Za-z0-9]+|[\u3040-\u30ff\u3400-\u9fff]", title)
+    return " ".join(word[0].upper() for word in words) or title[0]
+
+
+def _masked_guess_title(title: str) -> str:
+    visible_positions = {
+        index
+        for index, character in enumerate(title)
+        if not character.isspace() and (index % 3 == 0 or index == len(title) - 1)
+    }
+    return "".join(
+        character
+        if character.isspace() or not character.isalnum() or index in visible_positions
+        else "□"
+        for index, character in enumerate(title)
+    )
+
+
+def _format_guess_hints(session: GuessSession) -> str:
+    lines = [
+        f"增量提示 {session.hint_index}/{len(session.hints)}",
+        f"题面：{session.initial_clue}",
+    ]
+    lines.extend(
+        f"{index}. {hint.text}"
+        for index, hint in enumerate(session.hints[: session.hint_index], start=1)
+    )
+    lines.append("提示会继续累计；发送「提示」获取下一条。")
+    return "\n".join(lines)
 
 
 _KIND_ALIASES: dict[str, CosmeticKind] = {
@@ -973,6 +1339,7 @@ def _cosmetic_help(icon: CollectionItem | None, plate: CollectionItem | None) ->
     )
     return (
         f"当前 B50 外观：\n头像：{icon_text}\n姓名框：{plate_text}\n\n"
+        f"网页图鉴（搜索并点击复制 ID）：\n{COSMETIC_SITE_URL}\n\n"
         "搜索：/cosmetic 搜索 头像 初音\n"
         "搜索：/cosmetic 搜索 姓名框 橙将\n"
         "选择：/cosmetic 头像 101\n"
@@ -991,6 +1358,36 @@ def _format_search(kind: CosmeticKind, items: list[CollectionItem]) -> str:
     )
     rows.append(f"发送 /cosmetic {_kind_label(kind)} ID")
     return "\n".join(rows)
+
+
+def _song_resources(
+    confirmations: ChartConfirmationResult,
+) -> tuple[str, tuple[QuickAction, ...]]:
+    if not confirmations.entries:
+        return "", ()
+    preview_rows = [f"{confirmations.song_title}｜AWMC 在线谱面预览："]
+    actions: list[QuickAction] = []
+    for entry in confirmations.entries:
+        chart = entry.chart
+        short_label = ("紫" if chart.difficulty == 3 else "白") + chart.type_label
+        if entry.video:
+            actions.append(
+                QuickAction(
+                    f"🎬 {short_label}确认",
+                    url=entry.video.direct_url,
+                )
+            )
+        preview_url = "https://v.awmc.cc/preview?" + urlencode(
+            {
+                "song": chart.song_id,
+                "kind": chart.chart_type,
+                "diff": chart.difficulty + 2,
+            }
+        )
+        preview_rows.extend((chart_label(chart), preview_url))
+        actions.append(QuickAction(f"▶️ {short_label}预览", url=preview_url))
+    text_parts = [confirmations.as_text(), "\n".join(preview_rows)]
+    return "\n\n".join(part for part in text_parts if part), tuple(actions)
 
 
 def _kind_label(kind: CosmeticKind) -> str:
@@ -1037,6 +1434,7 @@ def _format_threshold(result, constant: float) -> str:
 
 async def _chat_score_context(
     scores: DivingFishService,
+    catalog: SongCatalogService,
     cache: dict[str, tuple[float, PlayerRecords]],
     user_id: str,
     message: str,
@@ -1044,20 +1442,81 @@ async def _chat_score_context(
     cached = cache.get(user_id)
     if cached and time.monotonic() - cached[0] < 300:
         records = cached[1]
-        return _score_snapshot(records, detailed=_asks_about_scores(message)) + _related_scores(
-            records, message
-        )
-    try:
-        records = await scores.player_records(user_id)
-    except NotBound:
-        return "该用户尚未绑定水鱼，因此当前没有可读取的成绩数据。"
-    except ScoreServiceError as exc:
-        logger.info("聊天成绩上下文暂不可用：%s", exc)
-        return "水鱼成绩本次暂时读取失败；不要假装看到了具体成绩。"
+    else:
+        try:
+            records = await scores.player_records(user_id)
+        except NotBound:
+            return "该用户尚未绑定水鱼，因此当前没有可读取的成绩数据。"
+        except ScoreServiceError as exc:
+            logger.info("聊天成绩上下文暂不可用：%s", exc)
+            return "水鱼成绩本次暂时读取失败；不要假装看到了具体成绩。"
+        cache[user_id] = (time.monotonic(), records)
 
-    snapshot = _score_snapshot(records, detailed=_asks_about_scores(message))
-    cache[user_id] = (time.monotonic(), records)
-    return snapshot + _related_scores(records, message)
+    detailed = _asks_about_scores(message)
+    fit_note = ""
+    if detailed:
+        try:
+            songs = await catalog.songs()
+            records, matched = _attach_fit_constants(records, songs)
+            fit_note = (
+                "\n【数据口径】官方定数来自成绩记录；水鱼拟合定数来自 chart_stats.fit_diff。"
+                f"本次成功匹配 {matched} 张已有成绩。回答拟合定数问题时必须使用“水鱼拟合定数”字段，"
+                "不得用官方定数代替。"
+            )
+        except SongCatalogError as exc:
+            logger.info("聊天拟合定数上下文暂不可用：%s", exc)
+            fit_note = "\n水鱼拟合定数目录本次读取失败；请明确说明无法核实，不要拿官方定数代替。"
+
+    snapshot = _score_snapshot(records, detailed=detailed)
+    return snapshot + _related_scores(records, message) + fit_note
+
+
+def _attach_fit_constants(
+    records: PlayerRecords,
+    songs: tuple[Song, ...],
+) -> tuple[PlayerRecords, int]:
+    by_id: dict[tuple[int, str, int], float] = {}
+    by_title: dict[tuple[str, str, int], float] = {}
+    for song in songs:
+        for chart in song.charts:
+            if chart.fit_constant is None:
+                continue
+            by_id[(song.id, chart.chart_type, chart.difficulty)] = chart.fit_constant
+            by_title[(_normalize_text(song.title), chart.chart_type, chart.difficulty)] = (
+                chart.fit_constant
+            )
+
+    matched = 0
+
+    def enrich(item: dict) -> dict:
+        nonlocal matched
+        copied = dict(item)
+        try:
+            difficulty = int(item.get("level_index", -1))
+        except (TypeError, ValueError):
+            difficulty = -1
+        chart_type = _record_type(item)
+        value = by_id.get((_normalized_song_id(item), chart_type, difficulty))
+        if value is None:
+            value = by_title.get(
+                (_normalize_text(str(item.get("title") or "")), chart_type, difficulty)
+            )
+        if value is not None:
+            copied["_fit_constant"] = value
+            matched += 1
+        return copied
+
+    return (
+        PlayerRecords(
+            nickname=records.nickname,
+            rating=records.rating,
+            additional_rating=records.additional_rating,
+            plate=records.plate,
+            old=[enrich(item) for item in records.old],
+            new=[enrich(item) for item in records.new],
+        ),
+        matched,
+    )
 
 
 def _score_snapshot(records: PlayerRecords, *, detailed: bool) -> str:
@@ -1083,15 +1542,26 @@ def _score_snapshot(records: PlayerRecords, *, detailed: bool) -> str:
 
 
 def _related_scores(records: PlayerRecords, message: str) -> str:
+    lowered = message.casefold()
+    best = records.best50()
+    if "b50" in lowered:
+        source_records = [*best.old, *best.new]
+    elif "b35" in lowered:
+        source_records = best.old
+    elif "b15" in lowered:
+        source_records = best.new
+    else:
+        source_records = [*records.old, *records.new]
     normalized = _normalize_text(message)
     words = [_normalize_text(word) for word in re.findall(r"[\w+：:!！?？.-]+", message)]
     words = [word for word in words if len(word) >= 2]
-    levels = set(re.findall(r"(?<!\d)(\d{1,2}\+?)(?![\d.])", message))
+    # Do not mistake the "50" in B50/R50/AP50 for a chart level.
+    levels = set(re.findall(r"(?<![\dA-Za-z])(\d{1,2}\+?)(?![\d.])", message))
     desired_rate = _mentioned_rate(message)
     fc_filter = "ap" if "ap" in message.casefold() else "fc" if "fc" in message.casefold() else ""
     negative = any(word in message.casefold() for word in ("没", "未", "没有", "不到"))
     matched = []
-    for item in [*records.old, *records.new]:
+    for item in source_records:
         title = _normalize_text(str(item.get("title") or ""))
         title_match = title and (title in normalized or any(word in title for word in words))
         structured = bool(levels or desired_rate or fc_filter)
@@ -1109,16 +1579,39 @@ def _related_scores(records: PlayerRecords, message: str) -> str:
             matched.append(item)
     if not matched:
         return ""
-    rows = ["\n与本次问题可能相关的水鱼成绩："]
+    ordering = ""
+    if "拟合" in message and any(word in message for word in ("最高", "最大", "最难")):
+        matched.sort(
+            key=lambda item: (
+                item.get("_fit_constant") is None,
+                -float(item.get("_fit_constant") or 0),
+            )
+        )
+        ordering = "（已按水鱼拟合定数从高到低）"
+    elif "拟合" in message and any(word in message for word in ("最低", "最小", "最简单")):
+        matched.sort(
+            key=lambda item: (
+                item.get("_fit_constant") is None,
+                float(item.get("_fit_constant") or 0),
+            )
+        )
+        ordering = "（已按水鱼拟合定数从低到高）"
+    rows = [f"\n与本次问题可能相关的水鱼成绩{ordering}："]
     rows.extend(_score_line(item, index + 1, "相关") for index, item in enumerate(matched[:20]))
     return "\n".join(rows)
 
 
 def _score_line(item: dict, index: int, group: str) -> str:
+    fit_value = item.get("_fit_constant")
+    try:
+        fit_text = f"{float(fit_value):.2f}" if fit_value is not None else "—"
+    except (TypeError, ValueError):
+        fit_text = "—"
     return (
         f"{group}#{index} {item.get('title', '未知')} "
         f"[{item.get('type', '?')} {item.get('level_label', '?')} {item.get('level', '?')}] "
-        f"定数{item.get('ds', '?')} {float(item.get('achievements', 0) or 0):.4f}% "
+        f"官方定数{item.get('ds', '?')} 水鱼拟合定数{fit_text} "
+        f"{float(item.get('achievements', 0) or 0):.4f}% "
         f"RA{int(item.get('ra', 0) or 0)} {item.get('rate', '')} "
         f"{item.get('fc') or '-'} {item.get('fs') or '-'}"
     )
@@ -1355,6 +1848,9 @@ def _asks_about_scores(message: str) -> bool:
 def _mentioned_rate(message: str) -> str:
     lowered = message.casefold()
     for label, value in (
+        ("鸟加", "sssp"),
+        ("鸟+", "sssp"),
+        ("鸟", "sss"),
         ("sss+", "sssp"),
         ("sss", "sss"),
         ("ss+", "ssp"),

@@ -3,18 +3,23 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import tempfile
 from collections.abc import Awaitable, Callable
 from urllib.parse import quote
 
 import httpx
 
-from .domain import BotReply, MessageContext
+from .domain import BotReply, MessageContext, QuickAction
 from .qq_command_panel import sync_group_command_panel
+from .qq_shortcuts import QQShortcutKeyboard
 from .router import CommandInfo
 
 logger = logging.getLogger(__name__)
 MessageHandler = Callable[[MessageContext], Awaitable[str | BotReply]]
+MessageFilter = Callable[[str], bool]
+
+_FULL_GROUP_MESSAGE_EVENT = "GROUP_MESSAGE_CREATE"
 
 
 class QQOfficialAdapter:
@@ -26,12 +31,14 @@ class QQOfficialAdapter:
         http: httpx.AsyncClient,
         handler: MessageHandler,
         panel_commands: tuple[CommandInfo, ...] = (),
+        unmentioned_group_filter: MessageFilter | None = None,
     ) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
         self._http = http
         self._handler = handler
         self._panel_commands = panel_commands
+        self._unmentioned_group_filter = unmentioned_group_filter
         self._ws = None
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -47,6 +54,7 @@ class QQOfficialAdapter:
                 QQWebSocket,
                 WSCallbacks,
             )
+            from qqbot_agent_sdk import websocket as qq_websocket_module
         except ImportError as exc:
             raise RuntimeError("缺少 qqbot-agent-sdk，请先安装项目依赖") from exc
 
@@ -54,6 +62,16 @@ class QQOfficialAdapter:
         api.setup(self._http)
         media_uploader = MediaUploader(api_client=api, http_client=self._http, log_tag="MaimaiBot")
         parser = EventParser()
+
+        # qqbot-agent-sdk 1.2.x only whitelists GROUP_AT_MESSAGE_CREATE even
+        # though QQ's official "receive all group messages" switch emits
+        # GROUP_MESSAGE_CREATE. Extend the in-memory whitelist until upstream
+        # exposes the event itself. No installed package files are modified.
+        if _FULL_GROUP_MESSAGE_EVENT not in qq_websocket_module.MESSAGE_EVENT_TYPES:
+            qq_websocket_module.MESSAGE_EVENT_TYPES = frozenset(
+                (*qq_websocket_module.MESSAGE_EVENT_TYPES, _FULL_GROUP_MESSAGE_EVENT)
+            )
+            logger.info("已启用 QQ 群全量消息事件兼容：%s", _FULL_GROUP_MESSAGE_EVENT)
         session_id: str | None = None
         sequence: int | None = None
 
@@ -65,9 +83,28 @@ class QQOfficialAdapter:
             session_id, sequence = new_session_id, new_sequence
 
         async def on_message(event_type: str, raw: dict) -> None:
-            event = parser.parse(event_type, raw)
+            parse_type = (
+                "GROUP_AT_MESSAGE_CREATE"
+                if event_type == _FULL_GROUP_MESSAGE_EVENT
+                else event_type
+            )
+            event = parser.parse(parse_type, raw)
             if event is None:
+                logger.warning("无法解析 QQ 消息事件：type=%s", event_type)
                 return
+            if (
+                event_type == _FULL_GROUP_MESSAGE_EVENT
+                and self._unmentioned_group_filter is not None
+                and not self._unmentioned_group_filter(event.content)
+            ):
+                logger.debug("忽略未命中指令的 QQ 群全量消息")
+                return
+            logger.info(
+                "收到 QQ 消息：type=%s scope=%s command=%s",
+                event_type,
+                event.chat_scope,
+                _command_label(event.content),
+            )
             context = MessageContext(
                 user_id=event.user_id,
                 chat_id=event.chat_id,
@@ -102,22 +139,34 @@ class QQOfficialAdapter:
                             QQMessageType,
                         )
                         if answer.followup_text:
-                            await api.send_text(
+                            await _send_text_reply(
+                                api,
                                 event.chat_scope,
                                 event.chat_id,
+                                event.message_id,
                                 answer.followup_text,
-                                reply_to=event.message_id,
-                                markdown=False,
+                                answer.quick_actions,
                             )
                 else:
                     text = answer.text if isinstance(answer, BotReply) else answer
-                    await api.send_text(
-                        event.chat_scope,
-                        event.chat_id,
-                        text,
-                        reply_to=event.message_id,
-                        markdown=False,
-                    )
+                    quick_actions = answer.quick_actions if isinstance(answer, BotReply) else ()
+                    if quick_actions:
+                        await _send_text_reply(
+                            api,
+                            event.chat_scope,
+                            event.chat_id,
+                            event.message_id,
+                            text,
+                            quick_actions,
+                        )
+                    else:
+                        await api.send_text(
+                            event.chat_scope,
+                            event.chat_id,
+                            text,
+                            reply_to=event.message_id,
+                            markdown=False,
+                        )
             except Exception:
                 logger.exception("处理 QQ 消息失败")
                 try:
@@ -167,6 +216,15 @@ class QQOfficialAdapter:
         finally:
             await self._ws.async_stop()
             self._ws = None
+
+
+def _command_label(content: str) -> str:
+    """Return a log-safe command label without recording message arguments."""
+    text = content.strip().lstrip("/")
+    if not text:
+        return "<empty>"
+    head = re.split(r"\s+", text, maxsplit=1)[0]
+    return head[:32]
 
 
 def _qq_avatar_url(raw: dict) -> str | None:
@@ -234,3 +292,47 @@ async def _send_png(
                 os.unlink(path)
             except FileNotFoundError:
                 pass
+
+
+async def _send_text_reply(
+    api: object,
+    chat_scope: str,
+    chat_id: str,
+    message_id: str,
+    text: str,
+    quick_actions: tuple[QuickAction, ...],
+) -> None:
+    """Send a passive text reply with an official QQ command keyboard.
+
+    Custom keyboards are a gated QQ capability. If the application has not
+    been granted it yet, keep /help usable by retrying the same passive reply
+    without the keyboard.
+    """
+    message = api.build_text_body(
+        text,
+        reply_to=message_id,
+        markdown=True,
+    )
+    keyboard = QQShortcutKeyboard(quick_actions)
+    try:
+        if chat_scope == "c2c":
+            await api.post_c2c_message(chat_id, message, keyboard=keyboard)
+        elif chat_scope == "group":
+            await api.post_group_message(chat_id, message, keyboard=keyboard)
+        else:
+            await api.send_text(
+                chat_scope,
+                chat_id,
+                text,
+                reply_to=message_id,
+                markdown=False,
+            )
+    except (RuntimeError, httpx.HTTPError) as exc:
+        logger.warning("QQ 官方快捷按钮发送失败，回退为普通帮助消息：%s", exc)
+        await api.send_text(
+            chat_scope,
+            chat_id,
+            text,
+            reply_to=message_id,
+            markdown=False,
+        )

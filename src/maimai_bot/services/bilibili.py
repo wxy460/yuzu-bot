@@ -65,6 +65,33 @@ class BilibiliVideo:
         return self.source_url or VIDEO_URL.format(bvid=self.bvid)
 
 
+@dataclass(frozen=True, slots=True)
+class ChartConfirmation:
+    chart: Chart
+    video: BilibiliVideo | None
+
+
+@dataclass(frozen=True, slots=True)
+class ChartConfirmationResult:
+    song_title: str
+    entries: tuple[ChartConfirmation, ...]
+
+    def as_text(self) -> str:
+        if not self.entries:
+            return ""
+        rows = [f"{self.song_title}｜B站谱面确认直链："]
+        for entry in self.entries:
+            label = chart_label(entry.chart)
+            if entry.video:
+                rows.extend(
+                    (f"{label} · {entry.video.uploader}", entry.video.direct_url)
+                )
+            else:
+                rows.append(f"{label}：本地审核索引暂未收录")
+        rows.append("来源：本地审核谱面库；查询时不会调用 B 站搜索接口，避免触发风控。")
+        return "\n".join(rows)
+
+
 class BilibiliChartService:
     """Resolve reviewed chart videos exclusively from a local metadata index.
 
@@ -79,12 +106,15 @@ class BilibiliChartService:
         self._persistent_videos = self._load_index()
 
     async def confirmation_links(self, song: Song) -> str:
+        return (await self.confirmations(song)).as_text()
+
+    async def confirmations(self, song: Song) -> ChartConfirmationResult:
         charts = sorted(
             (chart for chart in song.charts if chart.difficulty in {3, 4}),
             key=lambda chart: (chart.difficulty, chart.chart_type),
         )
         if not charts:
-            return ""
+            return ChartConfirmationResult(song.title, ())
 
         matched: dict[Chart, BilibiliVideo] = {}
         for chart in charts:
@@ -104,16 +134,10 @@ class BilibiliChartService:
                     if video:
                         matched[chart] = video
 
-        rows = [f"{song.title}｜B站谱面确认直链："]
-        for chart in charts:
-            video = matched.get(chart)
-            label = _chart_label(chart)
-            if video:
-                rows.extend((f"{label} · {video.uploader}", video.direct_url))
-            else:
-                rows.append(f"{label}：本地审核索引暂未收录")
-        rows.append("来源：本地审核谱面库；查询时不会调用 B 站搜索接口，避免触发风控。")
-        return "\n".join(rows)
+        return ChartConfirmationResult(
+            song.title,
+            tuple(ChartConfirmation(chart, matched.get(chart)) for chart in charts),
+        )
 
     def _find_match(
         self, song: Song, chart: Chart, videos: tuple[BilibiliVideo, ...]
@@ -253,7 +277,7 @@ def _matches_video(song: Song, chart: Chart, title: str, require_explicit_type: 
     return not (chart.chart_type == "standard" and explicit_dx)
 
 
-def _chart_label(chart: Chart) -> str:
+def chart_label(chart: Chart) -> str:
     color = "紫谱" if chart.difficulty == 3 else "白谱"
     difficulty = "MASTER" if chart.difficulty == 3 else "Re:MASTER"
     return f"{color} · {chart.type_label} {difficulty}"
