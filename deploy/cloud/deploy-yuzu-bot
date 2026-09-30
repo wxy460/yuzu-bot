@@ -48,6 +48,7 @@ if [[ ! -d "${release}" ]]; then
     .venv/bin/python -m compileall -q src
     .venv/bin/pytest -q
   )
+  chmod -R a+rX "${release}"
   trap - ERR
 fi
 
