@@ -263,6 +263,16 @@ Shell，也不能执行任意远程命令。工作流需要以下 Actions Secret
 
 如果将来要做图片版 B50，可在 `DivingFishService` 之上增加海报渲染 service，再调用官方 SDK 的图片上传接口；不需要改变 OAuth 和命令路由设计。
 
+## 待办事项
+
+- [ ] 恢复云端大模型聊天。当前生产服务器出口位于香港，直连
+  `api.llm.ustc.edu.cn:443` 会在 TCP 建连阶段超时；Cloudflare WARP
+  本地代理可以正常访问其他网站，但访问该接口仍返回目标不可达或 `502`，因此增加
+  HTTP 超时或更换模型名无法解决。后续可选方案：为 LLM 单独配置中国大陆固定
+  HTTP CONNECT/SOCKS5 出口、增加大陆中转，或接入云服务器可直连的另一家
+  OpenAI-compatible 模型供应商。代理只能作用于 LLM 客户端，QQ、水鱼和落雪继续直连；
+  凭据应保存在服务器独立的 root-only 配置中，不写入仓库或现有 `.env`。
+
 ## 安全与限制
 
 - `.env`、真实密钥和运行数据已被 `.gitignore` 排除。
