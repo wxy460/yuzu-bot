@@ -11,6 +11,7 @@ class MessageContext:
     content: str
     message_id: str
     avatar_url: str | None = None
+    image_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

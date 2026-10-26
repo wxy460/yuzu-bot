@@ -51,6 +51,7 @@ from .services.song_catalog import (
     format_chart,
     format_song,
 )
+from .services.song_recognition import RecognitionError, SongRecognitionService
 
 logger = logging.getLogger(__name__)
 HELP_SITE_URL = "https://fujisawa-yuzu-maimai-bot.chummy-chick-1306.chatgpt.site"
@@ -82,9 +83,11 @@ def build_router(
     catalog: SongCatalogService,
     chart_analysis: ChartAnalysisService,
     bilibili: BilibiliChartService,
+    recognition: SongRecognitionService | None = None,
 ) -> CommandRouter:
     score_context_cache: dict[str, tuple[float, PlayerRecords]] = {}
     guess_sessions: dict[str, GuessSession] = {}
+    recognition_waiting: dict[tuple[str, str, str], float] = {}
 
     async def guess_answer_reply(session: GuessSession, lead: str) -> str | BotReply:
         if session.song is None:
@@ -488,6 +491,75 @@ def build_router(
             entries,
             "\n".join(rows),
             subtitle="发送 /song ID 查看完整谱面详情",
+        )
+
+    def recognition_key(context: MessageContext) -> tuple[str, str, str]:
+        return context.chat_scope, context.chat_id, context.user_id
+
+    async def recognize_image(context: MessageContext) -> str | BotReply:
+        recognition_waiting.pop(recognition_key(context), None)
+        if recognition is None:
+            return "成绩识图暂未启用。"
+        try:
+            result = await recognition.recognize(context.image_urls[0])
+        except RecognitionError as exc:
+            return str(exc) + "\n发送 /识图 可重新尝试。"
+        if result.song is not None:
+            answer = await song_command(CommandRequest(context, "song", str(result.song.id)))
+            lead = f"识图结果：{result.song.title}（ID {result.song.id}，依据：{result.method}）。"
+            if isinstance(answer, BotReply):
+                return BotReply(
+                    text=answer.text,
+                    image_png=answer.image_png,
+                    followup_text=lead + "\n\n" + (answer.followup_text or answer.text),
+                    quick_actions=answer.quick_actions,
+                )
+            return lead + "\n\n" + answer
+        if result.candidates:
+            return "识别到多个可能的曲目，请用 /song ID 确认：\n" + "\n".join(
+                f"{song.id} — {song.title}" for song in result.candidates
+            )
+        suffix = (
+            "曲绘库首次建立中，请稍后重试；有清晰曲名的成绩图仍可识别。"
+            if result.indexing else "请尽量发送单曲成绩原图，保留清晰的曲名或完整曲绘。"
+        )
+        return "没有可靠识别出歌曲。" + suffix + "\n发送 /识图 可重新尝试。"
+
+    def waiting_for_image(context: MessageContext) -> bool:
+        deadline = recognition_waiting.get(recognition_key(context), 0)
+        return bool(
+            context.image_urls and deadline > time.monotonic()
+            and not router.recognizes_command(context.content)
+        )
+
+    router.set_image_handler(recognize_image, waiting_for_image)
+
+    @router.command(
+        "recognize", "识别下一张成绩图的歌曲并返回歌曲详情", aliases=("识图", "成绩识图"),
+        category="曲目", usage="/识图 → 3 分钟内发送成绩图（/识图 取消）",
+    )
+    async def recognize_command(request: CommandRequest) -> str | BotReply:
+        context = request.context
+        key = recognition_key(context)
+        if request.argument.strip().casefold() in {"取消", "cancel"}:
+            recognition_waiting.pop(key, None)
+            return "已取消这次成绩识图。"
+        if recognition is None:
+            return "成绩识图暂未启用。"
+        if context.image_urls:
+            return await recognize_image(context)
+        now = time.monotonic()
+        for old_key, deadline in list(recognition_waiting.items()):
+            if deadline <= now:
+                recognition_waiting.pop(old_key, None)
+        if len(recognition_waiting) >= 1024:
+            return "目前等待识图的人较多，请稍后重试。"
+        recognition_waiting[key] = now + 180
+        recognition.start_warming()
+        return (
+            "请在 3 分钟内发送你的下一张成绩图片，柚子会识别曲名或曲绘，"
+            "并返回 /song 一样的歌曲详情。每次识别一张图；发送 /识图 取消 可取消。\n"
+            "若本群未开启接收全部消息，发图时仍需 @机器人；也可以把 /识图 和图片一起发送。"
         )
 
     @router.command("info", "查看单曲与全部谱面详情", category="曲目", usage="info 潘")

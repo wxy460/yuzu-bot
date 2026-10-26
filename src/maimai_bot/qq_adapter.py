@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import tempfile
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from urllib.parse import quote
 
@@ -32,6 +33,7 @@ class QQOfficialAdapter:
         handler: MessageHandler,
         panel_commands: tuple[CommandInfo, ...] = (),
         unmentioned_group_filter: MessageFilter | None = None,
+        unmentioned_context_filter: Callable[[MessageContext], bool] | None = None,
     ) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
@@ -39,6 +41,7 @@ class QQOfficialAdapter:
         self._handler = handler
         self._panel_commands = panel_commands
         self._unmentioned_group_filter = unmentioned_group_filter
+        self._unmentioned_context_filter = unmentioned_context_filter
         self._ws = None
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -74,6 +77,7 @@ class QQOfficialAdapter:
             logger.info("已启用 QQ 群全量消息事件兼容：%s", _FULL_GROUP_MESSAGE_EVENT)
         session_id: str | None = None
         sequence: int | None = None
+        seen_messages: OrderedDict[tuple[str, str, str], None] = OrderedDict()
 
         def get_session() -> tuple[str | None, int | None]:
             return session_id, sequence
@@ -92,27 +96,38 @@ class QQOfficialAdapter:
             if event is None:
                 logger.warning("无法解析 QQ 消息事件：type=%s", event_type)
                 return
-            if (
-                event_type == _FULL_GROUP_MESSAGE_EVENT
-                and self._unmentioned_group_filter is not None
-                and not self._unmentioned_group_filter(event.content)
-            ):
-                logger.debug("忽略未命中指令的 QQ 群全量消息")
-                return
-            logger.info(
-                "收到 QQ 消息：type=%s scope=%s command=%s",
-                event_type,
-                event.chat_scope,
-                _command_label(event.content),
-            )
             context = MessageContext(
                 user_id=event.user_id,
                 chat_id=event.chat_id,
                 chat_scope=event.chat_scope,
-                content=event.content or ("/help" if event.chat_scope == "group" else ""),
+                content=event.content or (
+                    "/help" if event.chat_scope == "group" and not event.attachments
+                    and event_type != _FULL_GROUP_MESSAGE_EVENT else ""
+                ),
                 message_id=event.message_id,
                 avatar_url=_qq_avatar_url(raw)
                 or _qq_openid_avatar_url(self._app_id, event.user_id),
+                image_urls=_image_attachment_urls(event.attachments),
+            )
+            if event_type == _FULL_GROUP_MESSAGE_EVENT:
+                accepted = (
+                    self._unmentioned_context_filter(context)
+                    if self._unmentioned_context_filter is not None
+                    else self._unmentioned_group_filter is None
+                    or self._unmentioned_group_filter(event.content)
+                )
+                if not accepted:
+                    return
+            identity = (event.chat_scope, event.chat_id, event.message_id)
+            if event.message_id:
+                if identity in seen_messages:
+                    return
+                seen_messages[identity] = None
+                if len(seen_messages) > 1024:
+                    seen_messages.popitem(last=False)
+            logger.info(
+                "收到 QQ 消息：type=%s scope=%s command=%s",
+                event_type, event.chat_scope, _command_label(event.content),
             )
             try:
                 answer = await self._handler(context)
@@ -216,6 +231,23 @@ class QQOfficialAdapter:
         finally:
             await self._ws.async_stop()
             self._ws = None
+
+
+def _image_attachment_urls(attachments) -> tuple[str, ...]:
+    """Only current-message image attachments; never referenced-message images."""
+    urls = []
+    for attachment in attachments:
+        kind = attachment.content_type.lower()
+        if not kind.startswith("image/"):
+            continue
+        url = attachment.url.strip()
+        if url.startswith("//"):
+            url = "https:" + url
+        elif "://" not in url:
+            url = "https://" + url
+        if url.startswith(("https://", "http://")):
+            urls.append(url)
+    return tuple(dict.fromkeys(urls))
 
 
 def _command_label(content: str) -> str:

@@ -43,6 +43,21 @@ class CommandRouter:
         self._lookup: dict[str, CommandInfo] = {}
         self._patterns: list[_PatternRoute] = []
         self._fallback = fallback
+        self._image_handler: Callable[[MessageContext], Awaitable[Reply | None]] | None = None
+        self._image_filter: Callable[[MessageContext], bool] | None = None
+
+    def set_image_handler(
+        self,
+        handler: Callable[[MessageContext], Awaitable[Reply | None]],
+        predicate: Callable[[MessageContext], bool],
+    ) -> None:
+        self._image_handler = handler
+        self._image_filter = predicate
+
+    def accepts_context(self, context: MessageContext) -> bool:
+        return self.recognizes_command(context.content) or bool(
+            self._image_filter and self._image_filter(context)
+        )
 
     def command(
         self,
@@ -91,6 +106,10 @@ class CommandRouter:
         )
 
     async def dispatch(self, context: MessageContext) -> Reply:
+        if self._image_handler and self._image_filter and self._image_filter(context):
+            answer = await self._image_handler(context)
+            if answer is not None:
+                return answer
         text = context.content.strip()
         if text.startswith("/"):
             head, _, argument = text[1:].partition(" ")

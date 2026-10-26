@@ -17,6 +17,7 @@ from .services.chat import ChatService
 from .services.cosmetics import CosmeticService
 from .services.divingfish import DivingFishService
 from .services.song_catalog import SongCatalogService
+from .services.song_recognition import SongRecognitionService
 from .services.web_search import WebSearchService
 
 
@@ -62,12 +63,18 @@ async def run() -> None:
         )
         cosmetics = CosmeticService(http, state_path=project_root / "data" / "cosmetics.json")
         catalog = SongCatalogService(http)
+        recognition = SongRecognitionService(
+            http, catalog,
+            cache_dir=(project_root / "data" / "cosmetics.json").resolve().parent
+            / "song_recognition",
+        )
+        recognition.start_warming()
         chart_analysis = ChartAnalysisService(http)
         bilibili = BilibiliChartService(
             http, index_path=project_root / "data" / "bilibili_chart_videos.json"
         )
         router = build_router(
-            chat, scores, b50_images, cosmetics, catalog, chart_analysis, bilibili
+            chat, scores, b50_images, cosmetics, catalog, chart_analysis, bilibili, recognition
         )
         adapter = QQOfficialAdapter(
             app_id=settings.qq_app_id,
@@ -76,8 +83,12 @@ async def run() -> None:
             handler=router.dispatch,
             panel_commands=router.commands,
             unmentioned_group_filter=router.recognizes_command,
+            unmentioned_context_filter=router.accepts_context,
         )
-        await adapter.run(stop_event)
+        try:
+            await adapter.run(stop_event)
+        finally:
+            await recognition.close()
 
 
 def main() -> None:
