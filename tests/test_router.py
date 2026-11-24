@@ -54,6 +54,7 @@ async def test_bare_alias_with_argument_and_pattern_route() -> None:
     router.pattern(r"^(.+)是什么歌$", "song", lambda match: match.group(1))
     assert await router.dispatch(context("查歌 潘")) == "song:潘"
     assert await router.dispatch(context("11451是什么歌")) == "song:11451"
+    assert await router.dispatch(context("/11451是什么歌")) == "song:11451"
     assert "【曲目】" in router.help_text("曲目")
 
 

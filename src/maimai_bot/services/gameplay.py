@@ -5,11 +5,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from .divingfish import PlayerRecords
+from .legacy_plate_ids import LEGACY_REMASTER_IDS, LEGACY_SONG_IDS
+from .plate_names import normalize_plate_name
 from .song_catalog import PLATE_VERSION_ALIASES, Chart, Song, SongCatalogService
 
 DIFFICULTY_MARKS = {"绿": 0, "黄": 1, "红": 2, "紫": 3, "白": 4}
 FC_ORDER = {"": 0, "fc": 1, "fcp": 2, "ap": 3, "app": 4}
 FS_ORDER = {"": 0, "sync": 1, "fs": 2, "fsp": 3, "fsd": 4, "fsdp": 5, "fsdpx": 5}
+PLATE_NAME_PATTERN = (
+    r"(?:[真超檄橙暁晓曉桃櫻桜樱紫菫堇白雪輝辉熊華华爽煌宙星祭祝双雙宴镜鏡彩舞]"
+    r"(?:極|极|将|將|神|舞舞)|[霸覇]者|舞舞)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +40,12 @@ class PlateProgress:
     @property
     def percent(self) -> float:
         return len(self.completed) / len(self.entries) * 100 if self.entries else 0
+
+    def summary(self, nickname: str) -> str:
+        prefix = f"{nickname}｜{self.plate}进度"
+        if not self.entries:
+            return f"{prefix}：曲库暂无该版本的谱面数据。"
+        return f"{prefix} {len(self.completed)}/{len(self.entries)}（{self.percent:.1f}%）"
 
     @property
     def remaining_by_difficulty(self) -> dict[int, int]:
@@ -69,7 +81,7 @@ def ap50_text(records: PlayerRecords) -> str:
     rows = [f"{records.nickname} 的 AP50（共 {len(selected)} 张 AP/AP+ 谱面）"]
     rows.extend(record_line(item, index) for index, item in enumerate(selected[:50], 1))
     if not selected:
-        rows.append("水鱼记录中还没有 AP 或 AP+ 谱面。")
+        rows.append("当前账号还没有 AP 或 AP+ 谱面。")
     return "\n".join(rows)
 
 
@@ -77,16 +89,16 @@ def unavailable_history(kind: str, records: PlayerRecords) -> str:
     keys = {key for item in all_records(records) for key in item}
     needed = "游玩时间" if kind == "r50" else "游玩次数"
     return (
-        f"当前水鱼 OAuth 成绩记录不包含{needed}字段，因此无法可靠生成 {kind.upper()}。\n"
+        f"当前查分源的成绩记录不包含{needed}字段，因此无法可靠生成 {kind.upper()}。\n"
         f"已读取到的字段：{'、'.join(sorted(keys))}\n"
-        "这个命令已保留；以后数据源提供对应字段时可直接启用。不会要求绑定落雪，也不会伪造数据。"
+
     )
 
 
 def personal_song_text(records: PlayerRecords, song: Song) -> str:
     matched = [item for item in all_records(records) if _record_matches_song(item, song)]
     if not matched:
-        return f"水鱼中没有找到你在《{song.title}》上的成绩。"
+        return f"当前账号没有找到你在《{song.title}》上的成绩。"
     matched.sort(key=lambda item: (int(item.get("level_index", 0)), str(item.get("type", ""))))
     rows = [f"{records.nickname}｜{song.title}（ID {song.id}）"]
     rows.extend(record_line(item) for item in matched)
@@ -189,9 +201,7 @@ async def plate_progress_text(
     plate: str,
 ) -> str:
     progress = await build_plate_progress(records, catalog, plate)
-    rows = [
-        f"{records.nickname}｜{progress.plate}进度：{len(progress.completed)}/{len(progress.entries)}"
-    ]
+    rows = [progress.summary(records.nickname)]
     if progress.unfinished:
         rows.append("尚未达成（最多显示 25 张）：")
         rows.extend(
@@ -200,8 +210,6 @@ async def plate_progress_text(
             f"{entry.achievement:.4f}%"
             for entry in progress.unfinished[:25]
         )
-    if not progress.entries:
-        rows.append("公共曲库中未匹配到这个版本；请稍后重试或检查版本字。")
     return "\n".join(rows)
 
 
@@ -210,19 +218,13 @@ async def build_plate_progress(
     catalog: SongCatalogService,
     plate: str,
 ) -> PlateProgress:
-    normalized = (
-        plate.replace("晓", "暁")
-        .replace("樱", "櫻")
-        .replace("堇", "菫")
-        .replace("辉", "輝")
-        .replace("华", "華")
-    )
-    match = re.fullmatch(
-        r"([真超檄橙暁桃櫻紫菫白雪輝舞霸熊華爽煌宙星祭祝双宴镜鏡彩])([極极将神舞者]舞?)", normalized
-    )
-    if not match:
-        raise ValueError("牌子格式不正确，例如：橙将、紫极、舞舞、霸者。")
-    version, goal = match.groups()
+    normalized = normalize_plate_name(plate).replace("覇", "霸")
+    normalized = {"舞": "舞舞舞", "舞舞": "舞舞舞", "霸": "霸者"}.get(normalized, normalized)
+    if not re.fullmatch(PLATE_NAME_PATTERN, normalized):
+        raise ValueError("牌子格式不正确，例如：橙将、紫极、舞舞舞、霸者。")
+    if normalized == "真将":
+        raise ValueError("真代可查真极、真神、真舞舞；游戏没有发行真将。")
+    version, goal = normalized[0], normalized[1:]
     goal = "极" if goal == "極" else goal
     songs = await catalog.songs()
     if version in {"舞", "霸"}:
@@ -231,7 +233,9 @@ async def build_plate_progress(
             for song in songs
             for chart in song.charts
             if chart.chart_type == "standard"
-            and chart.difficulty in ({3, 4} if version == "舞" else {0, 1, 2, 3, 4})
+            and 10000 <= chart.version < 20000
+            and 0 <= chart.difficulty <= 4
+            and chart.song_id in (LEGACY_REMASTER_IDS if chart.difficulty == 4 else LEGACY_SONG_IDS)
         ]
     else:
         version_titles = PLATE_VERSION_ALIASES.get(version, ())
@@ -241,6 +245,7 @@ async def build_plate_progress(
             for chart in song.charts
             if version_titles
             and catalog.version_name(chart.version) in version_titles
+            and not (version == "真" and chart.song_id == 70)
             and chart.difficulty <= 3
         ]
     record_map = {_record_key(item): item for item in all_records(records)}
@@ -276,7 +281,8 @@ def plate_conditions() -> str:
         "舞萌牌子条件（按对应版本要求谱面）：\n"
         "极／極：FC 或以上\n将：达成率 100.0000%（SSS）或以上\n"
         "神：AP 或 AP+\n舞舞：FDX（Full Sync DX）或以上\n"
-        "霸者：初代至 FiNALE 的全部指定谱面达到 80.0000% 或以上\n"
+        "舞极、舞将、舞神、舞舞舞与霸者：初代至 FiNALE 的指定标准谱，含绿至紫谱和旧框指定白谱。\n"
+        "霸者要求达成率至少 80.0000%。真代没有将牌，真系列不计入ジングルベル。\n"
         "版本字：真超檄橙晓桃樱紫堇白雪辉／熊华爽煌宙星祭祝双宴镜彩。"
     )
 

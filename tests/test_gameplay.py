@@ -121,3 +121,61 @@ async def test_plate_progress_counts_unplayed_charts() -> None:
     assert len(progress.unfinished) == 2
     assert [entry.chart.song_id for entry in progress.unfinished] == [453, 452]
     assert progress.unfinished[0].achievement == 0
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from maimai_bot.domain import MessageContext
+from maimai_bot.features import build_router
+
+
+async def test_legacy_plates_use_cabinet_group_and_specific_remasters():
+    def make(song_id, version, kind="standard"):
+        charts = tuple(replace(chart(), song_id=song_id, version=version, chart_type=kind,
+                               difficulty=d) for d in range(5))
+        return Song(song_id, str(song_id), "", "", 0, version, charts)
+
+    # 70 is needed for the legacy group, but not 真. Link's Re:MASTER debuted on DX.
+    songs = (make(70, 10000), make(131, 15000), make(456, 16000), make(853, 19900),
+             make(456, 21000), make(70, 23000, "dx"))
+    catalog = SimpleNamespace(songs=AsyncMock(return_value=songs),
+                              version_name=lambda ver: {10000: "maimai", 16000: "PiNK"}.get(ver))
+    player = replace(records(), old=[{"song_id": 70, "level_index": 0, "type": "SD",
+                                      "achievements": 80, "fc": "", "fs": ""}])
+    for name in ("舞将", "舞極", "舞神", "舞舞舞", "舞", "霸者", "覇者"):
+        progress = await build_plate_progress(player, catalog, name)
+        ids = {(e.chart.song_id, e.chart.difficulty) for e in progress.entries}
+        assert ids == {(i, d) for i in (70, 131, 456) for d in range(4)} | {(70, 4)}
+        assert all(e.chart.chart_type == "standard" and e.chart.version < 20000 for e in progress.entries)
+        assert len(progress.completed) == (1 if progress.plate == "霸者" else 0)
+    assert not (await build_plate_progress(player, catalog, "真极")).entries
+    assert len((await build_plate_progress(player, catalog, "桃将")).entries) == 4
+    with pytest.raises(ValueError, match="没有发行真将"):
+        await build_plate_progress(player, catalog, "真将")
+
+
+async def test_group_command_recognizes_legacy_plate_names_without_mention():
+    router = build_router(None, None, None, None, None, None, None)
+    for text in ("舞将进度", "舞舞舞", "舞极完成表", "舞神进度", "覇者进度", "霸者", "舞进度"):
+        ctx = MessageContext("u", "g", "group", text, "id")
+        assert router.recognizes_command(text, ctx)
+
+
+@pytest.mark.parametrize(("alias", "official", "version"), [
+    ("镜將", "鏡将", "舞萌DX 2025"),
+    ("彩将", "彩将", "舞萌DX 2026"),
+    ("雙極", "双极", "舞萌DX 2024"),
+    ("曉神", "暁神", "ORANGE PLUS"),
+    ("桜舞舞", "櫻舞舞", "PiNK PLUS"),
+])
+async def test_plate_alias_reaches_the_same_progress_and_artwork(alias, official, version):
+    router = build_router(None, None, None, None, None, None, None)
+    query = f"{alias}进度"
+    assert router.recognizes_command(query, MessageContext("u", "g", "group", query, "id"))
+    song = Song(417, "Fragrance", "", "", 0, 15000, (chart(),))
+    catalog = SimpleNamespace(songs=AsyncMock(return_value=[song]), version_name=lambda _: version)
+    progress = await build_plate_progress(records(), catalog, alias)
+    assert progress.plate == official
+    assert len(progress.entries) == 1

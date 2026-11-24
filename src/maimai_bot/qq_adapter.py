@@ -7,6 +7,7 @@ import re
 import tempfile
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from urllib.parse import quote
 
 import httpx
@@ -18,9 +19,60 @@ from .router import CommandInfo
 
 logger = logging.getLogger(__name__)
 MessageHandler = Callable[[MessageContext], Awaitable[str | BotReply]]
+AmbientHandler = Callable[[MessageContext], Awaitable[str | None]]
 MessageFilter = Callable[[str], bool]
 
 _FULL_GROUP_MESSAGE_EVENT = "GROUP_MESSAGE_CREATE"
+_MENTION = re.compile(r"<@!?([^<>\s]+)>")
+
+
+@dataclass
+class _Delivery:
+    direct: bool
+    ambient_sent: bool = False
+    sending: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+def _self_mentions(raw, bot_ids):
+    ids = set(bot_ids)
+    marked = False
+    for member in raw.get("mentions") or ():
+        if not isinstance(member, dict) or member.get("scope") == "all":
+            continue
+        member_ids = {
+            v for key in ("id", "member_openid") if isinstance(v := member.get(key), str) and v
+        }
+        if member.get("is_you") is True or member_ids & bot_ids:
+            marked = True
+            ids.update(member_ids)
+    return ids, marked
+
+
+def _plain_group_message(raw, content):
+    if not content or not raw.get("id") or "@" in content or raw.get("message_type", 0) != 0:
+        return False
+    if any(
+        raw.get(field)
+        for field in (
+            "attachments",
+            "mentions",
+            "mention_everyone",
+            "ark_data",
+            "msg_elements",
+            "message_reference",
+            "referenced_message",
+        )
+    ):
+        return False
+    scene = raw.get("message_scene") or {}
+    return (
+        isinstance(scene, dict)
+        and scene.get("source", "default") == "default"
+        and not any(
+            isinstance(item, str) and item.startswith("ref_msg_idx=")
+            for item in scene.get("ext") or ()
+        )
+    )
 
 
 class QQOfficialAdapter:
@@ -34,6 +86,7 @@ class QQOfficialAdapter:
         panel_commands: tuple[CommandInfo, ...] = (),
         unmentioned_group_filter: MessageFilter | None = None,
         unmentioned_context_filter: Callable[[MessageContext], bool] | None = None,
+        ambient_handler: AmbientHandler | None = None,
     ) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
@@ -42,6 +95,7 @@ class QQOfficialAdapter:
         self._panel_commands = panel_commands
         self._unmentioned_group_filter = unmentioned_group_filter
         self._unmentioned_context_filter = unmentioned_context_filter
+        self._ambient_handler = ambient_handler
         self._ws = None
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -57,7 +111,6 @@ class QQOfficialAdapter:
                 QQWebSocket,
                 WSCallbacks,
             )
-            from qqbot_agent_sdk import websocket as qq_websocket_module
         except ImportError as exc:
             raise RuntimeError("缺少 qqbot-agent-sdk，请先安装项目依赖") from exc
 
@@ -66,18 +119,26 @@ class QQOfficialAdapter:
         media_uploader = MediaUploader(api_client=api, http_client=self._http, log_tag="MaimaiBot")
         parser = EventParser()
 
-        # qqbot-agent-sdk 1.2.x only whitelists GROUP_AT_MESSAGE_CREATE even
-        # though QQ's official "receive all group messages" switch emits
-        # GROUP_MESSAGE_CREATE. Extend the in-memory whitelist until upstream
-        # exposes the event itself. No installed package files are modified.
-        if _FULL_GROUP_MESSAGE_EVENT not in qq_websocket_module.MESSAGE_EVENT_TYPES:
-            qq_websocket_module.MESSAGE_EVENT_TYPES = frozenset(
-                (*qq_websocket_module.MESSAGE_EVENT_TYPES, _FULL_GROUP_MESSAGE_EVENT)
-            )
-            logger.info("已启用 QQ 群全量消息事件兼容：%s", _FULL_GROUP_MESSAGE_EVENT)
+        class GroupSocket(QQWebSocket):
+            def _handle_dispatch(self, event_type, data):
+                # The SDK drops duplicates by message ID before invoking user code.
+                # A full event must not swallow a later GROUP_AT event with the same ID.
+                if event_type == _FULL_GROUP_MESSAGE_EVENT:
+                    self._dispatch_to_main(self._cb.on_message_event(event_type, data))
+                else:
+                    super()._handle_dispatch(event_type, data)
+
         session_id: str | None = None
         sequence: int | None = None
-        seen_messages: OrderedDict[tuple[str, str, str], None] = OrderedDict()
+        seen_messages: OrderedDict[tuple[str, str, str], _Delivery] = OrderedDict()
+        bot_ids = frozenset({self._app_id})
+
+        def on_ready(ready) -> None:
+            nonlocal bot_ids
+            if ready.user:
+                bot_ids = frozenset(
+                    filter(None, (self._app_id, ready.user.id, ready.user.member_openid))
+                )
 
         def get_session() -> tuple[str | None, int | None]:
             return session_id, sequence
@@ -88,55 +149,102 @@ class QQOfficialAdapter:
 
         async def on_message(event_type: str, raw: dict) -> None:
             parse_type = (
-                "GROUP_AT_MESSAGE_CREATE"
-                if event_type == _FULL_GROUP_MESSAGE_EVENT
-                else event_type
+                "GROUP_AT_MESSAGE_CREATE" if event_type == _FULL_GROUP_MESSAGE_EVENT else event_type
             )
             event = parser.parse(parse_type, raw)
             if event is None or not event.user_id:
                 logger.warning("无法解析 QQ 消息事件：type=%s", event_type)
                 return
             content = event.content
+            full = event_type == _FULL_GROUP_MESSAGE_EVENT
+            addressed = not full
+            role = ""
             if event.chat_scope == "group":
-                # Some clients send a structured mention instead of a display name.
-                content = content.replace(f"<@!{self._app_id}>", "").replace(
-                    f"<@{self._app_id}>", ""
-                ).strip()
+                author = raw.get("author") or {}
+                if author.get("bot") or author.get("id") in bot_ids or event.user_id in bot_ids:
+                    return
+                role = author.get("member_role")
+                role = role if role in ("member", "admin", "owner") else ""
+                ids, marked = _self_mentions(raw, bot_ids)
+                original = str(raw.get("content") or "").strip()
+                addressed = (
+                    addressed or marked or any(m[1] in ids for m in _MENTION.finditer(original))
+                )
+                # The SDK removes a leading @displayName even for unrelated full events.
+                # Use QQ's original text for those events, including mentions of other people.
+                text = content if addressed else original
+                content = _MENTION.sub(lambda m: "" if m[1] in ids else m[0], text).strip()
             context = MessageContext(
                 user_id=event.user_id,
                 chat_id=event.chat_id,
                 chat_scope=event.chat_scope,
-                content=content or (
-                    "/help" if event.chat_scope == "group" and not event.attachments
-                    and event_type != _FULL_GROUP_MESSAGE_EVENT else ""
+                content=content
+                or (
+                    "/help"
+                    if event.chat_scope == "group" and not event.attachments and addressed
+                    else ""
                 ),
                 message_id=event.message_id,
                 avatar_url=_qq_avatar_url(raw)
                 or _qq_openid_avatar_url(self._app_id, event.user_id),
                 image_urls=_image_attachment_urls(event.attachments),
+                json_urls=_json_attachment_urls(event.attachments),
+                member_role=role,
             )
-            if event_type == _FULL_GROUP_MESSAGE_EVENT:
+            ambient = False
+            if full and not addressed:
                 accepted = (
                     self._unmentioned_context_filter(context)
                     if self._unmentioned_context_filter is not None
-                    else self._unmentioned_group_filter is None
-                    or self._unmentioned_group_filter(context.content)
+                    else self._unmentioned_group_filter
+                    and self._unmentioned_group_filter(context.content)
                 )
                 if not accepted:
-                    return
+                    if self._ambient_handler is None or not _plain_group_message(raw, content):
+                        return
+                    ambient = True
             identity = (event.chat_scope, event.chat_id, event.message_id)
-            if event.message_id:
-                if identity in seen_messages:
+            delivery = seen_messages.get(identity) if event.message_id else None
+            if delivery:
+                if delivery.direct or ambient:
                     return
-                seen_messages[identity] = None
+                # A genuine @ event has priority over a full event still being evaluated.
+                delivery.direct = True
+            else:
+                delivery = _Delivery(direct=not ambient)
+            if event.message_id:
+                seen_messages[identity] = delivery
+                seen_messages.move_to_end(identity)
                 if len(seen_messages) > 1024:
                     seen_messages.popitem(last=False)
+            if ambient:
+                try:
+                    answer = await self._ambient_handler(context)
+                    async with delivery.sending:
+                        if answer and not delivery.direct:
+                            await api.send_text(
+                                event.chat_scope,
+                                event.chat_id,
+                                answer,
+                                reply_to=event.message_id,
+                                markdown=False,
+                            )
+                            delivery.ambient_sent = True
+                except Exception as exc:  # noqa: BLE001 - keep optional group chatter silent
+                    # Exceptions may contain prompts, so omit their messages and tracebacks.
+                    logger.warning("QQ 群闲聊处理失败 (%s)", type(exc).__name__)
+                return
             logger.info(
-                "收到 QQ 消息：type=%s scope=%s command=%s",
-                event_type, event.chat_scope, _command_label(content),
+                "收到 QQ 消息：type=%s scope=%s",
+                event_type,
+                event.chat_scope,
             )
             try:
                 answer = await self._handler(context)
+                # QQ can deliver the AT copy after we already sent a passive reply.
+                async with delivery.sending:
+                    if delivery.ambient_sent:
+                        return
                 if isinstance(answer, BotReply) and answer.image_png:
                     if event.chat_scope not in ("c2c", "group"):
                         await api.send_text(
@@ -147,18 +255,33 @@ class QQOfficialAdapter:
                             markdown=False,
                         )
                     else:
-                        await _send_png(
-                            api,
-                            media_uploader,
-                            event.chat_scope,
-                            event.chat_id,
-                            event.message_id,
-                            answer.image_png,
-                            MEDIA_TYPE_IMAGE,
-                            MediaInfo,
-                            MessageToCreate,
-                            QQMessageType,
-                        )
+                        try:
+                            await _send_png(
+                                api,
+                                media_uploader,
+                                event.chat_scope,
+                                event.chat_id,
+                                event.message_id,
+                                answer.image_png,
+                                MEDIA_TYPE_IMAGE,
+                                MediaInfo,
+                                MessageToCreate,
+                                QQMessageType,
+                            )
+                        except (OSError, RuntimeError, httpx.HTTPError) as exc:
+                            logger.warning("QQ 图片发送失败，返回文字版：%s", type(exc).__name__)
+                            text = answer.text or "图片暂时无法发送。"
+                            if answer.followup_text and answer.followup_text not in text:
+                                text += "\n" + answer.followup_text
+                            await _send_text_reply(
+                                api,
+                                event.chat_scope,
+                                event.chat_id,
+                                event.message_id,
+                                text,
+                                answer.quick_actions,
+                            )
+                            return
                         if answer.followup_text:
                             await _send_text_reply(
                                 api,
@@ -188,8 +311,14 @@ class QQOfficialAdapter:
                             reply_to=event.message_id,
                             markdown=False,
                         )
-            except Exception:
-                logger.exception("处理 QQ 消息失败")
+            except Exception as exc:
+                async with delivery.sending:
+                    if delivery.ambient_sent:
+                        return
+                if event.chat_scope == "group":
+                    logger.warning("处理 QQ 群消息失败 (%s)", type(exc).__name__)
+                else:
+                    logger.exception("处理 QQ 消息失败")
                 try:
                     await api.send_text(
                         event.chat_scope,
@@ -202,6 +331,7 @@ class QQOfficialAdapter:
                     logger.exception("发送错误提示失败")
 
         callbacks = WSCallbacks(
+            on_ready=on_ready,
             on_message_event=on_message,
             on_connected=lambda: logger.info("已连接 QQ 官方网关"),
             on_disconnected=lambda: logger.warning("QQ 官方网关连接已断开，SDK 将尝试重连"),
@@ -216,7 +346,7 @@ class QQOfficialAdapter:
             clear_token=api.clear_token,
             fail_pending=lambda reason: logger.warning("QQ 待发送请求失败：%s", reason),
         )
-        self._ws = QQWebSocket(callbacks=callbacks, log_tag="MaimaiBot")
+        self._ws = GroupSocket(callbacks=callbacks, log_tag="MaimaiBot")
         await api.ensure_token()
         if self._panel_commands:
             for attempt in range(1, 4):
@@ -245,30 +375,42 @@ def _image_attachment_urls(attachments) -> tuple[str, ...]:
     for attachment in attachments:
         kind = attachment.content_type.casefold().split(";", 1)[0].strip()
         # Some mobile uploads use a generic MIME type but retain the filename.
-        image_filename = getattr(attachment, "filename", "").casefold().endswith(
-            (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+        image_filename = (
+            getattr(attachment, "filename", "")
+            .casefold()
+            .endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"))
         )
-        if not (kind.startswith("image/") or (
-            kind in ("", "application/octet-stream") and image_filename
-        )):
+        if not (
+            kind.startswith("image/")
+            or (kind in ("", "application/octet-stream") and image_filename)
+        ):
             continue
-        url = attachment.url.strip()
-        if url.startswith("//"):
-            url = "https:" + url
-        elif "://" not in url:
-            url = "https://" + url
-        if url.startswith(("https://", "http://")):
+        url = _attachment_url(attachment.url)
+        if url:
             urls.append(url)
     return tuple(dict.fromkeys(urls))
 
 
-def _command_label(content: str) -> str:
-    """Return a log-safe command label without recording message arguments."""
-    text = content.strip().lstrip("/")
-    if not text:
-        return "<empty>"
-    head = re.split(r"\s+", text, maxsplit=1)[0]
-    return head[:32]
+def _json_attachment_urls(attachments) -> tuple[str, ...]:
+    urls = []
+    for attachment in attachments:
+        kind = attachment.content_type.partition(";")[0].strip().casefold()
+        if kind == "application/json" or attachment.filename.casefold().endswith(".json"):
+            url = _attachment_url(attachment.url)
+            if url:
+                urls.append(url)
+    return tuple(dict.fromkeys(urls))
+
+
+def _attachment_url(value: str) -> str:
+    url = value.strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = "https:" + url
+    elif "://" not in url:
+        url = "https://" + url
+    return url if url.startswith(("https://", "http://")) else ""
 
 
 def _qq_avatar_url(raw: dict) -> str | None:
@@ -352,6 +494,9 @@ async def _send_text_reply(
     been granted it yet, keep /help usable by retrying the same passive reply
     without the keyboard.
     """
+    if not quick_actions:
+        await api.send_text(chat_scope, chat_id, text, reply_to=message_id, markdown=False)
+        return
     message = api.build_text_body(
         text,
         reply_to=message_id,

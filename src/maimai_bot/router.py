@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from re import Pattern
 
 from .domain import BotReply, CommandRequest, MessageContext
+from .help_catalog import group_commands, select_group
 
 Reply = str | BotReply
 Handler = Callable[[CommandRequest], Awaitable[Reply]]
@@ -29,6 +30,13 @@ class _PatternRoute:
     regex: Pattern[str]
     target: str
     argument: ArgumentFactory
+    when: Callable[[MessageContext], bool] | None
+
+    def match(self, text: str, context: MessageContext | None):
+        match = self.regex.fullmatch(text)
+        if match and (self.when is None or (context is not None and self.when(context))):
+            return match
+        return None
 
 
 class CommandRouter:
@@ -43,20 +51,17 @@ class CommandRouter:
         self._lookup: dict[str, CommandInfo] = {}
         self._patterns: list[_PatternRoute] = []
         self._fallback = fallback
-        self._image_handler: Callable[[MessageContext], Awaitable[Reply | None]] | None = None
-        self._image_filter: Callable[[MessageContext], bool] | None = None
+        self._attachments: dict[str, tuple[Callable[[MessageContext], Awaitable[Reply | None]], Callable[[MessageContext], bool]]] = {}
 
-    def set_image_handler(
-        self,
-        handler: Callable[[MessageContext], Awaitable[Reply | None]],
-        predicate: Callable[[MessageContext], bool],
-    ) -> None:
-        self._image_handler = handler
-        self._image_filter = predicate
+    def add_attachment_handler(self, handler, predicate, *, kind="file") -> None:
+        self._attachments[kind] = handler, predicate
+
+    def set_image_handler(self, handler, predicate) -> None:
+        self.add_attachment_handler(handler, predicate, kind="image")
 
     def accepts_context(self, context: MessageContext) -> bool:
-        return self.recognizes_command(context.content) or bool(
-            self._image_filter and self._image_filter(context)
+        return self.recognizes_command(context.content, context) or any(
+            predicate(context) for _, predicate in self._attachments.values()
         )
 
     def command(
@@ -93,6 +98,8 @@ class CommandRouter:
         expression: str,
         target: str,
         argument: ArgumentFactory | None = None,
+        *,
+        when: Callable[[MessageContext], bool] | None = None,
     ) -> None:
         normalized = _normalize_name(target)
         if normalized not in self._commands:
@@ -102,34 +109,34 @@ class CommandRouter:
                 re.compile(expression, re.IGNORECASE),
                 normalized,
                 argument or (lambda match: match.group(0)),
+                when,
             )
         )
 
     async def dispatch(self, context: MessageContext) -> Reply:
-        if self._image_handler and self._image_filter and self._image_filter(context):
-            answer = await self._image_handler(context)
-            if answer is not None:
-                return answer
-        text = context.content.strip()
-        if text.startswith("/"):
-            head, _, argument = text[1:].partition(" ")
-            return await self._dispatch_named(context, head, argument.strip(), unknown=True)
-
+        for handler, predicate in self._attachments.values():
+            if predicate(context):
+                answer = await handler(context)
+                if answer is not None:
+                    return answer
+        content = context.content.strip()
+        text = content.removeprefix("/")
         head, _, argument = text.partition(" ")
-        if head.casefold() in self._lookup:
-            return await self._dispatch_named(context, head, argument.strip(), unknown=False)
+        command = self._lookup.get(head.casefold())
+        if command:
+            return await command.handler(CommandRequest(context, command.name, argument.strip()))
         for route in self._patterns:
-            match = route.regex.fullmatch(text)
+            match = route.match(text, context)
             if match:
-                return await self._dispatch_named(
-                    context,
-                    route.target,
-                    route.argument(match).strip(),
-                    unknown=False,
+                command = self._commands[route.target]
+                return await command.handler(
+                    CommandRequest(context, command.name, route.argument(match).strip())
                 )
+        if content.startswith("/"):
+            return "未知命令。发送 /help 查看可用功能。"
         return await self._fallback(context)
 
-    def recognizes_command(self, content: str) -> bool:
+    def recognizes_command(self, content: str, context: MessageContext | None = None) -> bool:
         """Return whether plain text should be treated as a bot command.
 
         QQ's ``GROUP_MESSAGE_CREATE`` event contains every message in a group.
@@ -144,22 +151,7 @@ class CommandRouter:
         head, _, _ = text.partition(" ")
         if head.casefold() in self._lookup:
             return True
-        return any(route.regex.fullmatch(text) for route in self._patterns)
-
-    async def _dispatch_named(
-        self,
-        context: MessageContext,
-        name: str,
-        argument: str,
-        *,
-        unknown: bool,
-    ) -> Reply:
-        info = self._lookup.get(name.casefold().strip().lstrip("/"))
-        if info is None:
-            if unknown:
-                return "未知命令。发送 /help 查看可用功能。"
-            return await self._fallback(context)
-        return await info.handler(CommandRequest(context, info.name, argument))
+        return any(route.match(text, context) for route in self._patterns)
 
     @property
     def commands(self) -> tuple[CommandInfo, ...]:
@@ -167,22 +159,21 @@ class CommandRouter:
         return tuple(self._commands.values())
 
     def help_text(self, category: str = "") -> str:
-        categories: dict[str, list[CommandInfo]] = {}
-        for command in self._commands.values():
-            categories.setdefault(command.category, []).append(command)
-        requested = category.strip().casefold()
-        selected = next((name for name in categories if name.casefold() == requested), None)
-        if requested and selected is None:
-            return "没有这个帮助分类。可用分类：" + "、".join(categories)
-        names = [selected] if selected else list(categories)
-        lines = ["舞萌 Bot 指令帮助（/ 可省略）："]
-        for category_name in names:
-            lines.append(f"\n【{category_name}】")
-            for item in categories[category_name]:
+        groups = group_commands(self.commands)
+        if category:
+            title, items = select_group(self.commands, category)
+            if not items:
+                available = dict.fromkeys((*groups, *group_commands(self.commands, legacy=True)))
+                return "可查看的帮助分类有 " + "、".join(available)
+            groups = {title: items}
+        lines = ["柚子指令帮助（/ 可省略）"]
+        for title, items in groups.items():
+            lines.append(f"\n【{title}】")
+            for item in items:
                 example = item.usage or f"/{item.name}"
                 lines.append(f"{example} — {item.description}")
-        if not selected:
-            lines.append("\n可发送 /help 分类名 只看一类，例如 /help 成绩。")
+        if not category:
+            lines.append("\n发送 /help 分类名查看一类指令，或发送 帮助maimaiDX 查看舞萌目录。")
         lines.append("直接 @机器人 说话可进入对话。")
         return "\n".join(lines)
 

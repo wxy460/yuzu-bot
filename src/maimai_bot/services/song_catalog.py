@@ -127,6 +127,7 @@ class SongCatalogService:
         self._http = http
         self._cache_seconds = cache_seconds
         self._songs: tuple[Song, ...] = ()
+        self._utage: tuple[dict[str, Any], ...] = ()
         self._versions: dict[int, str] = {}
         self._aliases: dict[int, tuple[str, ...]] = {}
         self._loaded_at = 0.0
@@ -177,10 +178,21 @@ class SongCatalogService:
                 # catalogue unavailable when that auxiliary endpoint is down.
                 aliases = {}
             self._songs = tuple(song for song in songs if song.charts)
+            self._utage = tuple(
+                item for item in payload.get("songs", [])
+                if (item.get("difficulties") or {}).get("utage")
+            )
             self._versions = versions
             self._aliases = aliases
             self._loaded_at = time.monotonic()
             return self._songs
+
+    async def utage(self, query: str) -> list[dict[str, Any]]:
+        await self.songs()
+        if query.isdecimal():
+            return [item for item in self._utage if item["id"] == int(query)]
+        needle = _normalize(query)
+        return [item for item in self._utage if needle and needle in _normalize(item["title"])]
 
     async def search(self, query: str, *, limit: int = 10) -> list[Song]:
         query = query.strip()

@@ -2,15 +2,37 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import secrets
+import sqlite3
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 AUTH_BASE = "https://auth.diving-fish.com"
+AUTHORIZED_APPS = f"{AUTH_BASE}/apps"
 PROBER_BASE = "https://www.diving-fish.com/api/maimaidxprober"
 SCOPE = "prober.records.read"
+
+
+def chart_play_count(record: dict[str, Any]) -> int | None:
+    """Only an explicit count for this chart represents lifetime plays."""
+    counts = set()
+    for field in ("play_count", "playCount"):
+        value = record.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            try:
+                value = int(value)
+            except ValueError:
+                return None
+        if type(value) is not int or value < 0:
+            return None
+        counts.add(value)
+    return counts.pop() if len(counts) == 1 else None
 
 
 class ScoreServiceError(RuntimeError):
@@ -77,12 +99,33 @@ def _format_score(item: dict[str, Any], index: int) -> str:
 class DivingFishService:
     """Diving-Fish confidential-client device binding and on-behalf-of flow."""
 
-    def __init__(self, http: httpx.AsyncClient, *, client_id: str, client_secret: str) -> None:
+    scope = SCOPE
+
+    def __init__(
+        self,
+        http: httpx.AsyncClient,
+        *,
+        client_id: str,
+        client_secret: str,
+        binding_state: Path | None = None,
+    ) -> None:
         self._http = http
         self._client_id = client_id
         self._client_secret = client_secret
         self._tokens: dict[str, tuple[str, float]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        if binding_state is not None:
+            binding_state.parent.mkdir(parents=True, exist_ok=True)
+        self._bindings = sqlite3.connect(binding_state or ":memory:")
+        if binding_state is not None:
+            binding_state.chmod(0o600)
+        self._bindings.execute("""
+            CREATE TABLE IF NOT EXISTS water_binding (
+                original TEXT PRIMARY KEY, subject TEXT NOT NULL, requested INTEGER NOT NULL)
+        """)
+
+    def close(self):
+        self._bindings.close()
 
     @property
     def enabled(self) -> bool:
@@ -92,20 +135,49 @@ class DivingFishService:
         value = f"{self._client_id}:{external_id}".encode()
         return hashlib.sha256(value).hexdigest()
 
-    def _subject(self, external_id: str) -> str:
-        return "ref:" + self._subject_ref(external_id)
+    def _binding(self, user: str) -> tuple[str, int]:
+        # Existing installations used a deterministic ref. Preserve that ref until
+        # its owner explicitly unlinks it, then permanently abandon the old grant.
+        original = self._subject_ref(user)
+        row = self._bindings.execute(
+            "SELECT subject,requested FROM water_binding WHERE original=?", (original,)
+        ).fetchone()
+        # 0 = locally disconnected, 1 = eligible to request a token,
+        # 2 = this grant has successfully returned a token before.
+        return (row[0], row[1]) if row else (original, 1)
+
+    def history_key(self, user: str) -> str:
+        subject, _ = self._binding(user)
+        return user if subject == self._subject_ref(user) else f"water:{subject}:{user}"
+
+    def unlink(self, user: str) -> None:
+        original = self._subject_ref(user)
+        subject, _ = self._binding(user)
+        with self._bindings:
+            self._bindings.execute(
+                "INSERT OR REPLACE INTO water_binding VALUES(?,?,0)",
+                (original, secrets.token_hex(32)),
+            )
+        self._tokens.pop(subject, None)
+
+    def has_current_token(self, user: str) -> bool:
+        subject, _ = self._binding(user)
+        cached = self._tokens.get(subject)
+        return bool(cached and time.time() < cached[1] - 30)
 
     async def start_binding(self, external_id: str) -> BindingInfo:
         self._require_enabled()
-        label = _masked_label(external_id)
+        game = "舞萌 DX" if self.scope == SCOPE else "中二节奏"
+        label = f"{game} · {_masked_label(external_id)}"
+        subject, _ = self._binding(external_id)
         try:
             response = await self._http.post(
                 f"{AUTH_BASE}/oauth/device_authorization",
                 data={
                     "client_id": self._client_id,
                     "client_secret": self._client_secret,
-                    "scope": SCOPE,
-                    "subject_ref": self._subject_ref(external_id),
+                    "scope": self.scope,
+                    "subject_ref": subject,
                     "binding_label": label,
                 },
                 timeout=15,
@@ -115,13 +187,21 @@ class DivingFishService:
         await _raise_api_error(response, "创建绑定链接失败")
         try:
             data = response.json()
-            return BindingInfo(
+            binding = BindingInfo(
                 url=str(data["verification_uri_complete"]),
                 user_code=str(data["user_code"]),
                 expires_in=int(data.get("expires_in", 600)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ScoreServiceError("水鱼授权服务返回了无法识别的数据") from exc
+        if self._binding(external_id)[0] != subject:
+            raise NotBound("本次绑定已取消，请重新发送 /bind。")
+        with self._bindings:
+            self._bindings.execute(
+                "UPDATE water_binding SET requested=1 WHERE original=? AND subject=? AND requested=0",
+                (self._subject_ref(external_id), subject),
+            )
+        return binding
 
     async def best50(self, external_id: str) -> Best50:
         return (await self.player_records(external_id)).best50()
@@ -129,11 +209,14 @@ class DivingFishService:
     async def player_records(self, external_id: str) -> PlayerRecords:
         """Return every score exposed by the user's Diving-Fish OAuth grant."""
         self._require_enabled()
+        subject, _ = self._binding(external_id)
         token = await self._access_token(external_id)
         old_data, new_data = await asyncio.gather(
-            self._records(token, is_new=False),
-            self._records(token, is_new=True),
+            self._records(token, subject, is_new=False),
+            self._records(token, subject, is_new=True),
         )
+        if self._binding(external_id)[0] != subject:
+            raise NotBound("本次查询的水鱼绑定已解除。")
         return PlayerRecords(
             nickname=str(old_data.get("nickname") or new_data.get("nickname") or "玩家"),
             rating=int(old_data.get("rating") or new_data.get("rating") or 0),
@@ -146,13 +229,18 @@ class DivingFishService:
         )
 
     async def _access_token(self, external_id: str) -> str:
-        cached = self._tokens.get(external_id)
+        subject, state = self._binding(external_id)
+        if state == 0:
+            raise NotBound("已停用此身份的水鱼舞萌绑定。")
+        cached = self._tokens.get(subject)
         if cached and time.time() < cached[1] - 30:
             return cached[0]
 
         lock = self._locks.setdefault(external_id, asyncio.Lock())
         async with lock:
-            cached = self._tokens.get(external_id)
+            if self._binding(external_id)[0] != subject:
+                raise NotBound("本次查询的水鱼绑定已解除。")
+            cached = self._tokens.get(subject)
             if cached and time.time() < cached[1] - 30:
                 return cached[0]
             try:
@@ -162,8 +250,8 @@ class DivingFishService:
                         "grant_type": "urn:diving-fish:params:oauth:grant-type:on-behalf-of",
                         "client_id": self._client_id,
                         "client_secret": self._client_secret,
-                        "subject": self._subject(external_id),
-                        "scope": SCOPE,
+                        "subject": "ref:" + subject,
+                        "scope": self.scope,
                     },
                     timeout=15,
                 )
@@ -172,6 +260,10 @@ class DivingFishService:
             if response.status_code == 400:
                 try:
                     if response.json().get("error") == "consent_required":
+                        if self._binding(external_id) == (subject, 2):
+                            # A previously usable grant disappeared at the provider.
+                            # Quarantine prior chat/rating history just as for /unbind.
+                            self.unlink(external_id)
                         raise NotBound("尚未绑定水鱼账号")
                 except ValueError:
                     pass
@@ -182,10 +274,22 @@ class DivingFishService:
                 expires_in = int(data.get("expires_in", 300))
             except (KeyError, TypeError, ValueError) as exc:
                 raise ScoreServiceError("水鱼授权服务返回了无法识别的数据") from exc
-            self._tokens[external_id] = (token, time.time() + expires_in)
+            if self._binding(external_id)[0] != subject:
+                raise NotBound("本次查询的水鱼绑定已解除。")
+            if state != 2:
+                original = self._subject_ref(external_id)
+                with self._bindings:
+                    self._bindings.execute(
+                        "INSERT OR IGNORE INTO water_binding VALUES(?,?,2)", (original, subject)
+                    )
+                    self._bindings.execute(
+                        "UPDATE water_binding SET requested=2 WHERE original=? AND subject=?",
+                        (original, subject),
+                    )
+            self._tokens[subject] = (token, time.time() + expires_in)
             return token
 
-    async def _records(self, token: str, *, is_new: bool) -> dict[str, Any]:
+    async def _records(self, token: str, subject: str, *, is_new: bool) -> dict[str, Any]:
         try:
             response = await self._http.get(
                 f"{PROBER_BASE}/player/records",
@@ -196,9 +300,20 @@ class DivingFishService:
         except httpx.HTTPError as exc:
             raise ScoreServiceError(f"连接水鱼查分器失败：{exc}") from exc
         if response.status_code == 401:
-            self._tokens.clear()
+            cached = self._tokens.get(subject)
+            if cached and cached[0] == token:
+                self._tokens.pop(subject, None)
         await _raise_api_error(response, "查询成绩失败")
-        return response.json()
+        data = response.json()
+        for record in data.get("records", ()):
+            if "play_count" in record or "playCount" in record:
+                count = chart_play_count(record)
+                record.pop("playCount", None)
+                if count is None:
+                    record.pop("play_count", None)
+                else:
+                    record["play_count"] = count
+        return data
 
     def _require_enabled(self) -> None:
         if not self.enabled:

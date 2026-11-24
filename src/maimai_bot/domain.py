@@ -12,6 +12,8 @@ class MessageContext:
     message_id: str
     avatar_url: str | None = None
     image_urls: tuple[str, ...] = ()
+    member_role: str = ""
+    json_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

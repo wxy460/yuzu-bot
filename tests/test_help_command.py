@@ -35,15 +35,18 @@ async def test_help_returns_preview_image_and_site_link() -> None:
     assert images.command_count == len(router.commands)
 
 
-async def test_categorized_help_remains_text_only() -> None:
+async def test_categorized_help_includes_copyable_examples_and_explicit_text_mode() -> None:
     images = HelpImageStub()
     unused = object()
     router = build_router(unused, unused, images, unused, unused, unused, unused)  # type: ignore[arg-type]
 
     reply = await router.dispatch(_context("/help 成绩"))
 
-    assert isinstance(reply, str)
-    assert "【成绩】" in reply
+    assert isinstance(reply, BotReply) and reply.image_png
+    assert "/ap50" in reply.followup_text
+    text = await router.dispatch(_context("/help 文字 成绩"))
+    assert isinstance(text, str)
+    assert "【成绩】" in text
     assert images.command_count == 0
 
 

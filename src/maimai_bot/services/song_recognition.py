@@ -8,16 +8,20 @@ import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import httpx
 from PIL import Image, ImageOps
 
 from .lxns_assets import LxnsAssetError, download_lxns_png
+from .qq_attachments import (
+    MAX_ATTACHMENT_BYTES,
+    attachment_url_allowed,  # noqa: F401 - existing public import
+    download_qq_attachment,
+)
 from .song_catalog import Song, SongCatalogService
 
 logger = logging.getLogger(__name__)
-MAX_BYTES = 12_000_000
+MAX_BYTES = MAX_ATTACHMENT_BYTES
 MAX_PIXELS = 20_000_000
 
 
@@ -59,24 +63,6 @@ def text_candidates(lines: list[str], songs: tuple[Song, ...]) -> list[tuple[flo
         if best >= 0.72:
             scored.append((best, song))
     return sorted(scored, key=lambda item: (-item[0], item[1].id))
-
-
-def attachment_url_allowed(url: str) -> bool:
-    parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
-    try:
-        valid_port = parts.port in (None, 80, 443)
-    except ValueError:
-        return False
-    return (
-        parts.scheme in ("https", "http")
-        and valid_port
-        and parts.username is None
-        and parts.password is None
-        and any(host == domain or host.endswith("." + domain) for domain in (
-            "qq.com", "qq.com.cn", "qpic.cn", "gtimg.com", "qlogo.cn",
-        ))
-    )
 
 
 class SongRecognitionService:
@@ -154,21 +140,10 @@ class SongRecognitionService:
             temporary.replace(path)
 
     async def _download(self, url: str) -> bytes:
-        for _ in range(4):
-            if not attachment_url_allowed(url):
-                raise RecognitionError("图片地址不是受支持的 QQ 附件地址，请直接发送图片。")
-            async with self._http.stream("GET", url, follow_redirects=False, timeout=20) as response:
-                if response.is_redirect:
-                    url = str(response.url.join(response.headers["location"]))
-                    continue
-                response.raise_for_status()
-                data = bytearray()
-                async for chunk in response.aiter_bytes():
-                    data.extend(chunk)
-                    if len(data) > MAX_BYTES:
-                        raise RecognitionError("图片超过 12 MB，请压缩后重新发送。")
-                return bytes(data)
-        raise RecognitionError("图片地址重定向过多，请重新发送原图。")
+        try:
+            return await download_qq_attachment(self._http, url, label="图片", limit=MAX_BYTES)
+        except ValueError as exc:
+            raise RecognitionError(str(exc)) from exc
 
     async def recognize(self, url: str) -> RecognitionResult:
         self.start_warming()

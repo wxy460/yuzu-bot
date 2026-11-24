@@ -16,7 +16,7 @@ jobs:
   deploy:
     runs-on: ubuntu-24.04
     environment: production
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - name: Deploy through restricted SSH key
         env:

@@ -11,6 +11,11 @@ readonly STATE_DIR="/var/lib/yuzu-bot"
 readonly SERVICE="yuzu-bot.service"
 readonly LOCK_FILE="/run/lock/yuzu-bot-deploy.lock"
 
+# The forced SSH command runs in a public Actions log. Keep message traffic on the host.
+show_service_state() {
+  systemctl show --no-pager --property=ActiveState,SubState,Result,MainPID "${SERVICE}"
+}
+
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
   echo "A yuzu-bot deployment is already running." >&2
@@ -60,7 +65,7 @@ sleep 3
 
 if ! systemctl is-active --quiet "${SERVICE}"; then
   echo "Deployment ${commit} failed health check; rolling back." >&2
-  journalctl -u "${SERVICE}" -n 80 --no-pager >&2 || true
+  show_service_state >&2 || true
   if [[ -n "${previous}" && -d "${previous}" ]]; then
     ln -sfn "${previous}" "${CURRENT}.rollback"
     mv -Tf "${CURRENT}.rollback" "${CURRENT}"
@@ -70,4 +75,4 @@ if ! systemctl is-active --quiet "${SERVICE}"; then
 fi
 
 echo "Deployed yuzu-bot ${commit}"
-systemctl --no-pager --full status "${SERVICE}" | sed -n '1,12p'
+show_service_state

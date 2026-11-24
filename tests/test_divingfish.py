@@ -123,3 +123,24 @@ async def test_player_records_keeps_scores_outside_best50() -> None:
     assert len(records.new) == 50
     assert len(records.best50().old) == 35
     assert len(records.best50().new) == 15
+
+
+async def test_player_records_require_explicit_consistent_per_chart_count():
+    rows = [
+        {"playCount": "37"}, {"play_count": 0},
+        {"play_count": 4, "playCount": "4"}, {"play_count": 3, "playCount": 7},
+        {"count": 90, "total_play_count": 400, "play_time": "2026-11-01"},
+        {"play_count": True}, {"playCount": -1}, {"play_count": 4.5},
+    ]
+
+    def respond(request):
+        if request.url.path.endswith("/oauth/token"):
+            return httpx.Response(200, json={"access_token": "test", "expires_in": 300})
+        return httpx.Response(200, json={"play_count": 999, "records": rows})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        service = DivingFishService(http, client_id="client", client_secret="secret")
+        result = await service.player_records("user")
+        assert [r.get("play_count") for r in result.old] == [37, 0, 4, None, None, None, None, None]
+        assert all("playCount" not in r for r in result.old)
+        service.close()

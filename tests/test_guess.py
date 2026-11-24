@@ -74,12 +74,13 @@ async def test_guess_hints_accumulate_and_advance() -> None:
     first = await router.dispatch(context("/hint"))
     second = await router.dispatch(context("/hint"))
 
-    assert "艺术家：xi" in start
-    assert "增量提示 1/" in first
-    assert "增量提示 2/" in second
-    assert "歌曲 ID" not in first + second
-    assert "1. 歌名是英文/拉丁字母标题，共 2 个词。" in first
-    assert "1. 歌名是英文/拉丁字母标题，共 2 个词。" in second
+    assert all(isinstance(r, BotReply) and r.image_png for r in (start, first, second))
+    assert "艺术家：xi" in start.text
+    assert "增量提示 1/" in first.text
+    assert "增量提示 2/" in second.text
+    assert "歌曲 ID" not in first.text + second.text
+    assert "线索 1：歌名是英文/拉丁字母标题，共 2 个词。" in first.text
+    assert "线索 1：歌名是英文/拉丁字母标题，共 2 个词。" in second.text
 
 
 async def test_guess_accepts_alias_after_using_hints() -> None:
@@ -123,7 +124,18 @@ async def test_reveal_includes_song_detail_image_without_video_link() -> None:
     assert isinstance(result, BotReply)
     assert result.image_png == b"song-detail"
     assert "答案是 Glorious Crown（ID 1234）。" in result.text
-    assert not result.followup_text
+    assert result.followup_text == "答案是 Glorious Crown（ID 1234）。"
+
+
+async def test_hash_song_answer_only_in_active_session():
+    unused = object()
+    router = build_router(unused, unused, GuessImageStub(), unused, GuessCatalogStub(), unused, unused)
+    answer = context("#Glorious Crown")
+    assert not router.accepts_context(answer)
+    await router.dispatch(context("/guess"))
+    assert router.accepts_context(answer)
+    assert "答对啦" in (await router.dispatch(answer)).text
+    assert not router.accepts_context(answer)
 
 
 def test_masked_title_is_helpful_without_revealing_full_answer() -> None:
@@ -144,7 +156,8 @@ async def test_guess_combines_constant_version_and_type_filters() -> None:
 
     result = await router.dispatch(context("/guess 14.0-14.5 桃-紫 DX"))
 
-    assert "限定范围：14.0-14.5 桃-紫 DX" in result
+    assert isinstance(result, BotReply)
+    assert "限定范围：14.0-14.5 桃-紫 DX" in result.text
     assert catalog.last_random_argument == "master 14.0-14.5 桃-紫 DX"
 
 
@@ -192,7 +205,7 @@ async def test_guess_hints_do_not_repeat_selected_scope() -> None:
     )
 
     await router.dispatch(context("/guess 桃代 14+ DX"))
-    messages = [str(await router.dispatch(context("提示"))) for _ in range(8)]
+    messages = [(await router.dispatch(context("提示"))).text for _ in range(8)]
     combined = "\n".join(messages)
 
     assert "初次收录于 PiNK" not in combined
@@ -222,6 +235,7 @@ async def test_guess_help_explains_composable_scopes() -> None:
 
     result = await router.dispatch(context("/guess help"))
 
-    assert "桃-紫 DX" in result
-    assert "未指定难度时默认 MASTER" in result
+    assert isinstance(result, BotReply) and result.image_png
+    assert "桃-紫 DX" in result.followup_text
+    assert "未指定难度时默认 MASTER" in result.text
     assert catalog.last_random_argument == ""

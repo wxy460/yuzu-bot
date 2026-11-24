@@ -12,9 +12,10 @@ import httpx
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, UnidentifiedImageError
 
 from .daily_recommendation import DailyRecommendations, RecommendationItem
-from .divingfish import Best50, PlayerRecords
+from .divingfish import Best50, PlayerRecords, chart_play_count
 from .gameplay import PlateEntry, PlateProgress
 from .lxns_assets import LxnsAssetError, download_lxns_png
+from .plate_art import PlateArtwork
 from .rating import rating_for
 from .song_catalog import Chart, Song
 
@@ -42,8 +43,6 @@ DIFFICULTY_COLORS = {
     3: "#9852d9",
     4: "#d6a3ff",
 }
-LXNS_PLATE_LIST_URL = "https://maimai.lxns.net/api/v0/maimai/plate/list"
-BUNDLED_PLATES = {"橙将": "6113.png"}
 
 
 class B50RenderError(RuntimeError):
@@ -76,9 +75,7 @@ class B50ImageService:
         self._cover_slots = asyncio.Semaphore(8)
         self._avatar_cache: dict[str, bytes | None] = {}
         self._avatar_lock = asyncio.Lock()
-        self._plate_ids: dict[str, int] | None = None
-        self._plate_cache: dict[str, bytes | None] = {}
-        self._plate_lock = asyncio.Lock()
+        self._plates = PlateArtwork(http, background_path.parent / "plates")
 
     async def render(
         self,
@@ -131,17 +128,27 @@ class B50ImageService:
         avatar_url: str | None = None,
     ) -> bytes:
         """Render a B50-style long image containing up to 100 personal scores."""
-        cosmetics = cosmetics or CosmeticProfile()
         selected = records[:100]
+        cosmetics, covers = await self._table_assets(player, selected, cosmetics, avatar_url)
+        try:
+            return self._draw_score_table(player, selector, selected, cosmetics, covers)
+        except Exception as exc:
+            raise B50RenderError(f"生成分表图片失败：{exc}") from exc
+
+    async def _table_assets(
+        self, player: PlayerRecords | None, selected: list[dict[str, Any]],
+        cosmetics: CosmeticProfile | None, avatar_url: str | None,
+    ) -> tuple[CosmeticProfile, list[bytes | None]]:
+        cosmetics = cosmetics or CosmeticProfile()
         cover_task = asyncio.gather(*(self._cover_for(item) for item in selected))
         plate_task = (
             asyncio.sleep(0, result=cosmetics.nameplate_png)
-            if cosmetics.nameplate_png
+            if cosmetics.nameplate_png or player is None
             else self._nameplate_for(player.plate)
         )
         avatar_task = (
             asyncio.sleep(0, result=cosmetics.avatar_png)
-            if cosmetics.avatar_png or not avatar_url
+            if cosmetics.avatar_png or not avatar_url or player is None
             else self._avatar_for(avatar_url)
         )
         covers, resolved_plate, resolved_avatar = await asyncio.gather(
@@ -154,10 +161,29 @@ class B50ImageService:
             nameplate_png=cosmetics.nameplate_png or resolved_plate,
             background_png=cosmetics.background_png,
         )
+        return cosmetics, list(covers)
+
+    async def render_pc50(
+        self, player: PlayerRecords | None, records: list[dict[str, Any]],
+        cosmetics: CosmeticProfile | None = None, *, avatar_url: str | None = None,
+    ) -> bytes:
+        """Rank charts with known play counts, using the caller's order to break ties."""
+        from .pc50_image import draw_pc50
+
+        ranked = []
+        for record in records:
+            count = chart_play_count(record)
+            if count is not None:
+                ranked.append((count, record))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        ranked = ranked[:50]
+        assets, covers = await self._table_assets(
+            player, [record for _, record in ranked], cosmetics, avatar_url
+        )
         try:
-            return self._draw_score_table(player, selector, selected, cosmetics, list(covers))
+            return draw_pc50(self, player, ranked, assets, covers)
         except Exception as exc:
-            raise B50RenderError(f"生成分表图片失败：{exc}") from exc
+            raise B50RenderError(f"生成游玩次数榜失败：{exc}") from exc
 
     async def render_record_list(
         self,
@@ -252,12 +278,16 @@ class B50ImageService:
         except Exception as exc:
             raise B50RenderError(f"生成每日推歌图片失败：{exc}") from exc
 
-    def render_help(self, commands: tuple[Any, ...]) -> bytes:
+    def render_help(self, commands: tuple[Any, ...], *, title: str = "柚子菜单", legacy: bool = False) -> bytes:
         """Render the complete command list for clients that cannot open the web help."""
         try:
-            return self._draw_help(commands)
+            from .academy import draw_menu
+            return draw_menu(commands, title=title, legacy=legacy)
         except Exception as exc:
             raise B50RenderError(f"生成帮助菜单图片失败：{exc}") from exc
+
+    async def song_jacket(self, song_id: int) -> bytes | None:
+        return await self._cover_for({"song_id": song_id})
 
     async def _cover_for(self, record: dict[str, Any]) -> bytes | None:
         try:
@@ -340,132 +370,7 @@ class B50ImageService:
         return content
 
     async def _nameplate_for(self, plate_name: str) -> bytes | None:
-        """Resolve a Diving-Fish plate title to the matching original-game asset."""
-        name = plate_name.strip()
-        use_default = not name or name == "舞萌玩家"
-        if use_default:
-            name = "デフォルト"
-        bundled_name = BUNDLED_PLATES.get(name)
-        if bundled_name:
-            bundled_path = self._background_path.parent / "plates" / bundled_name
-            try:
-                return bundled_path.read_bytes()
-            except OSError:
-                logger.warning("本地姓名框素材 %s 无法读取，尝试在线获取", bundled_path)
-        async with self._plate_lock:
-            if name in self._plate_cache:
-                return self._plate_cache[name]
-            try:
-                if self._plate_ids is None:
-                    response = await self._http.get(LXNS_PLATE_LIST_URL, timeout=20)
-                    response.raise_for_status()
-                    plates = response.json().get("plates", [])
-                    self._plate_ids = {
-                        str(item["name"]): int(item["id"])
-                        for item in plates
-                        if item.get("name") and item.get("id") is not None
-                    }
-                plate_id = 1 if use_default else self._plate_ids.get(name)
-                if plate_id is None:
-                    content = None
-                else:
-                    content = await download_lxns_png(self._http, "plate", plate_id)
-            except (
-                httpx.HTTPError,
-                LxnsAssetError,
-                TypeError,
-                ValueError,
-                AttributeError,
-            ):
-                logger.info("姓名框 %s 的原游戏素材暂不可用，使用文字样式", name)
-                content = None
-            # Do not make a transient CDN/catalogue failure permanent for the
-            # lifetime of the bot. Successful assets can still be reused.
-            if content is not None:
-                self._plate_cache[name] = content
-            return content
-
-    def _draw_help(self, commands: tuple[Any, ...]) -> bytes:
-        categories: dict[str, list[Any]] = {}
-        for command in commands:
-            categories.setdefault(str(command.category), []).append(command)
-
-        section_heights = {
-            name: 58 + ((len(items) + 1) // 2) * 98 + 18 for name, items in categories.items()
-        }
-        canvas_size = (1600, 245 + sum(section_heights.values()) + 120)
-        background = Image.open(self._background_path).convert("RGB")
-        canvas = ImageOps.fit(background, canvas_size, method=Image.Resampling.LANCZOS)
-        canvas = canvas.filter(ImageFilter.GaussianBlur(radius=1.0))
-        overlay = Image.new("RGBA", canvas_size, (255, 255, 255, 0))
-        draw = ImageDraw.Draw(overlay)
-        draw.rounded_rectangle(
-            (38, 30, 1562, canvas_size[1] - 30),
-            radius=40,
-            fill=(246, 248, 255, 235),
-            outline=(255, 255, 255, 250),
-            width=5,
-        )
-
-        draw.rounded_rectangle((70, 58, 1530, 196), radius=34, fill=(42, 37, 83, 238))
-        draw.rounded_rectangle((70, 58, 890, 69), radius=5, fill="#60ded1")
-        draw.rounded_rectangle((890, 58, 1530, 69), radius=5, fill="#d995ee")
-        draw.text((112, 80), "柚子菜单", font=_font(49, bold=True), fill="white")
-        draw.text(
-            (112, 143),
-            "舞萌 Bot 指令中心 · 指令前的 / 不可省略",
-            font=_font(23, bold=True),
-            fill="#d8d4fa",
-        )
-        tip = "@机器人 + 普通文字：和藤泽柚子聊天"
-        tip_font = _font(24, bold=True)
-        draw.text(
-            (1488 - draw.textlength(tip, font=tip_font), 111),
-            tip,
-            font=tip_font,
-            fill="#91ece3",
-        )
-
-        y = 225
-        accents = ("#6d63d9", "#8e55d7", "#3d9f9a", "#d36f9e")
-        for section_index, (category, items) in enumerate(categories.items()):
-            accent = accents[section_index % len(accents)]
-            draw.rounded_rectangle((72, y, 1528, y + 48), radius=24, fill=accent)
-            draw.text((102, y + 8), category, font=_font(25, bold=True), fill="white")
-            y += 62
-            for index, command in enumerate(items):
-                col, row = index % 2, index // 2
-                x = 74 + col * 730
-                card_y = y + row * 98
-                draw.rounded_rectangle(
-                    (x, card_y, x + 708, card_y + 82),
-                    radius=20,
-                    fill=(255, 255, 255, 238),
-                    outline=accent,
-                    width=3,
-                )
-                usage = str(command.usage or f"/{command.name}")
-                usage = _fit_text(draw, usage, _font(23, bold=True), 655)
-                description = _fit_text(draw, str(command.description), _font(19), 655)
-                draw.text((x + 22, card_y + 12), usage, font=_font(23, bold=True), fill=accent)
-                draw.text((x + 22, card_y + 48), description, font=_font(19), fill="#4d4868")
-            y += ((len(items) + 1) // 2) * 98 + 16
-
-        footer_y = canvas_size[1] - 92
-        footer = "无法打开网页也没关系：/help 永远会直接发送这张完整菜单"
-        footer_font = _font(22, bold=True)
-        footer_width = draw.textlength(footer, font=footer_font)
-        draw.text(
-            ((1600 - footer_width) / 2, footer_y),
-            footer,
-            font=footer_font,
-            fill="#5a527d",
-        )
-
-        canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay).convert("RGB")
-        output = io.BytesIO()
-        canvas.save(output, format="PNG", compress_level=6)
-        return output.getvalue()
+        return await self._plates.resolve(plate_name)
 
     def _draw_record_list(
         self,
@@ -544,7 +449,7 @@ class B50ImageService:
         y: int,
     ) -> None:
         x, width, height = 72, 1056, 132
-        level_index = int(record.get("level_index", 3) or 3)
+        level_index = int(record["level_index"]) if record.get("level_index") is not None else 3
         accent = DIFFICULTY_COLORS.get(level_index, "#9852d9")
         draw.rounded_rectangle(
             (x + 7, y + 8, x + width + 7, y + height + 8), radius=19, fill=(43, 34, 77, 65)
@@ -1166,7 +1071,7 @@ class B50ImageService:
             )
         draw.text(
             (1100, 113),
-            f"{percent:.1f}% 已完成",
+            f"{percent:.1f}% 已完成" if progress.entries else "进度待定",
             font=_font(38, bold=True),
             fill="#5a4da0",
         )
@@ -1175,7 +1080,7 @@ class B50ImageService:
             for index, (entry, cover) in enumerate(zip(displayed, covers, strict=True)):
                 self._draw_plate_entry(draw, overlay, entry, cover, 225 + index * 134)
         else:
-            message = "全部条件已经达成！"
+            message = "全部条件已经达成！" if progress.entries else "曲库暂无该版本的谱面数据"
             width = draw.textlength(message, font=_font(58, bold=True))
             draw.text(((1600 - width) / 2, 570), message, font=_font(58, bold=True), fill="#7956c8")
 
@@ -1274,12 +1179,16 @@ class B50ImageService:
             "舞舞": "全部指定谱面取得 FDX 或以上",
             "者": "全部指定谱面达到 80.0000% 或以上",
         }
-        lines = (
-            f"目标条件：{conditions.get(progress.goal, progress.goal)}",
-            f"总体进度：{len(progress.completed)} / {len(progress.entries)}，还剩 {remain} 张谱面",
-            f"剩余难度：{diff_text}",
-            "中间严格按谱面定数从高到低展示前 8 张；未游玩按 0.0000% 计算。",
-        )
+        lines = [f"目标条件：{conditions.get(progress.goal, progress.goal)}"]
+        if progress.entries:
+            lines.append(
+                f"总体进度：{len(progress.completed)} / {len(progress.entries)}，还剩 {remain} 张谱面"
+            )
+            lines.append(f"剩余难度：{diff_text}")
+            if remain:
+                lines.append("中间按谱面定数从高到低展示前 8 张，未游玩按 0.0000% 计算。")
+        else:
+            lines.append("总体进度：等待曲库收录后计算")
         for index, line in enumerate(lines):
             draw.text(
                 (125, y + 53 + index * 42),
@@ -1368,19 +1277,17 @@ class B50ImageService:
                 outline="#8a68d1",
                 width=3,
             )
-            width = draw.textlength(progress.plate, font=_font(48, bold=True))
-            draw.text(
-                (target_left + target_width / 2 - width / 2, y + 78),
-                progress.plate,
-                font=_font(48, bold=True),
-                fill="#6548b3",
-            )
+            center = target_left + target_width // 2
+            draw.text((center, y + 92), progress.plate, font=_font(37, bold=True),
+                      fill="#6548b3", anchor="mm")
+            draw.text((center, y + 132), "原版素材暂缺", font=_font(18),
+                      fill="#665b7e", anchor="mm")
 
     def _draw_header(
         self,
         draw: ImageDraw.ImageDraw,
         overlay: Image.Image,
-        best50: Best50,
+        best50: Best50 | PlayerRecords,
         cosmetics: CosmeticProfile,
         summary: tuple[tuple[str, str], tuple[str, str]] | None = None,
     ) -> None:
@@ -1432,12 +1339,11 @@ class B50ImageService:
                 fill="#665ba4",
             )
 
-        old_total = sum(int(item.get("ra", 0) or 0) for item in best50.old[:35])
-        new_total = sum(int(item.get("ra", 0) or 0) for item in best50.new[:15])
-        left_summary, right_summary = summary or (
-            ("BEST 35", str(old_total)),
-            ("NEW 15", str(new_total)),
-        )
+        if summary is None:
+            old_total = sum(int(item.get("ra", 0) or 0) for item in best50.old[:35])
+            new_total = sum(int(item.get("ra", 0) or 0) for item in best50.new[:15])
+            summary = (("BEST 35", str(old_total)), ("NEW 15", str(new_total)))
+        left_summary, right_summary = summary
         summary = (980, 66, 1505, 184)
         draw.rounded_rectangle(summary, radius=24, fill=(42, 37, 83, 238))
         draw.rounded_rectangle((980, 66, 1242, 75), radius=5, fill="#64ded2")

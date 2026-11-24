@@ -45,6 +45,10 @@ class Settings:
     divingfish_client_id: str = ""
     divingfish_client_secret: str = ""
     log_level: str = "INFO"
+    lxns_client_id: str = ""
+    lxns_client_secret: str = ""
+    lxns_redirect_uri: str = ""
+    lxns_callback_port: str = "8632"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -70,6 +74,10 @@ class Settings:
             chat_history_turns=_positive_int("CHAT_HISTORY_TURNS", 8),
             divingfish_client_id=os.getenv("DIVINGFISH_CLIENT_ID", "").strip(),
             divingfish_client_secret=os.getenv("DIVINGFISH_CLIENT_SECRET", "").strip(),
+            lxns_client_id=os.getenv("LXNS_CLIENT_ID", "").strip(),
+            lxns_client_secret=os.getenv("LXNS_CLIENT_SECRET", "").strip(),
+            lxns_redirect_uri=os.getenv("LXNS_REDIRECT_URI", "").strip(),
+            lxns_callback_port=os.getenv("LXNS_CALLBACK_PORT", "8632").strip(),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
 
