@@ -93,14 +93,20 @@ class QQOfficialAdapter:
                 else event_type
             )
             event = parser.parse(parse_type, raw)
-            if event is None:
+            if event is None or not event.user_id:
                 logger.warning("无法解析 QQ 消息事件：type=%s", event_type)
                 return
+            content = event.content
+            if event.chat_scope == "group":
+                # Some clients send a structured mention instead of a display name.
+                content = content.replace(f"<@!{self._app_id}>", "").replace(
+                    f"<@{self._app_id}>", ""
+                ).strip()
             context = MessageContext(
                 user_id=event.user_id,
                 chat_id=event.chat_id,
                 chat_scope=event.chat_scope,
-                content=event.content or (
+                content=content or (
                     "/help" if event.chat_scope == "group" and not event.attachments
                     and event_type != _FULL_GROUP_MESSAGE_EVENT else ""
                 ),
@@ -114,7 +120,7 @@ class QQOfficialAdapter:
                     self._unmentioned_context_filter(context)
                     if self._unmentioned_context_filter is not None
                     else self._unmentioned_group_filter is None
-                    or self._unmentioned_group_filter(event.content)
+                    or self._unmentioned_group_filter(context.content)
                 )
                 if not accepted:
                     return
@@ -127,7 +133,7 @@ class QQOfficialAdapter:
                     seen_messages.popitem(last=False)
             logger.info(
                 "收到 QQ 消息：type=%s scope=%s command=%s",
-                event_type, event.chat_scope, _command_label(event.content),
+                event_type, event.chat_scope, _command_label(content),
             )
             try:
                 answer = await self._handler(context)
@@ -237,8 +243,14 @@ def _image_attachment_urls(attachments) -> tuple[str, ...]:
     """Only current-message image attachments; never referenced-message images."""
     urls = []
     for attachment in attachments:
-        kind = attachment.content_type.lower()
-        if not kind.startswith("image/"):
+        kind = attachment.content_type.casefold().split(";", 1)[0].strip()
+        # Some mobile uploads use a generic MIME type but retain the filename.
+        image_filename = getattr(attachment, "filename", "").casefold().endswith(
+            (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+        )
+        if not (kind.startswith("image/") or (
+            kind in ("", "application/octet-stream") and image_filename
+        )):
             continue
         url = attachment.url.strip()
         if url.startswith("//"):

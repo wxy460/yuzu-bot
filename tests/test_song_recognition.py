@@ -99,7 +99,14 @@ async def test_attached_command_and_cancel():
     assert "/识图" in router.help_text("曲目")
 
 
-async def test_official_adapter_delivers_followup_image_without_mention(monkeypatch):
+@pytest.mark.parametrize(("command_type", "command_text"), [
+    ("GROUP_AT_MESSAGE_CREATE", "<@!123> /成绩识图"),
+    ("GROUP_MESSAGE_CREATE", "<@123>/识图"),
+    ("GROUP_MESSAGE_CREATE", "/识图"),
+])
+async def test_official_adapter_delivers_followup_image_without_mention(
+    monkeypatch, command_type, command_text
+):
     import qqbot_agent_sdk as sdk
 
     router, recognizer = make_router()
@@ -134,15 +141,23 @@ async def test_official_adapter_delivers_followup_image_without_mention(monkeypa
             async def events():
                 try:
                     base = {"group_openid": "group", "author": {"member_openid": "alice"}}
-                    command = {**base, "id": "command", "content": "/识图"}
+                    command = {**base, "id": "command", "content": command_text}
                     image = {**base, "id": "image", "content": "", "attachments": [
-                        {"url": URL, "content_type": "image/jpeg"}
+                        {"url": URL, "content_type": "application/octet-stream", "filename": "成绩.JPG"}
                     ]}
                     await self.callbacks.on_message_event(
                         "GROUP_MESSAGE_CREATE", {**base, "id": "empty", "content": ""}
                     )
+                    await self.callbacks.on_message_event(command_type, {**command, "author": {}})
+                    await self.callbacks.on_message_event("GROUP_MESSAGE_CREATE", {
+                        **command, "id": "another-mention", "content": "<@456>/成绩识图"
+                    })
                     assert not sent
-                    await self.callbacks.on_message_event("GROUP_AT_MESSAGE_CREATE", command)
+                    await self.callbacks.on_message_event(command_type, command)
+                    await self.callbacks.on_message_event("GROUP_MESSAGE_CREATE", {
+                        **image, "id": "bob-image", "author": {"member_openid": "bob"}
+                    })
+                    assert not recognizer.calls
                     await self.callbacks.on_message_event("GROUP_MESSAGE_CREATE", image)
                     await self.callbacks.on_message_event("GROUP_AT_MESSAGE_CREATE", image)
                 finally:
@@ -175,6 +190,7 @@ def test_attachments_only_take_images_and_normalize_urls():
         SimpleNamespace(content_type="image/jpeg", url="//gchat.qpic.cn/a"),
         SimpleNamespace(content_type="image/png", url="multimedia.nt.qq.com.cn/b"),
         SimpleNamespace(content_type="video/mp4", url=URL),
+        SimpleNamespace(content_type="application/octet-stream", filename="song.mp4", url=URL),
     ]
     assert _image_attachment_urls(attachments) == (
         "https://gchat.qpic.cn/a", "https://multimedia.nt.qq.com.cn/b"
