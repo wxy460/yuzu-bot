@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from maimai_bot.features import build_router
-from maimai_bot.help_catalog import group_commands
+from maimai_bot.help_catalog import command_examples, command_usage, group_commands, topic_for
 from maimai_bot.services.lxns_scores import ScoreSources
 
 SITE = Path(__file__).resolve().parents[1] / "bot-homepage/dist/index.html"
@@ -34,7 +34,16 @@ def render_site(source: str) -> str:
         group_life=unused,
     )
     rows = [
-        [cmd.name, cmd.category, cmd.description, cmd.usage, list(cmd.aliases), section]
+        [
+            cmd.name,
+            cmd.category,
+            cmd.description,
+            command_usage(cmd),
+            list(cmd.aliases),
+            section,
+            command_examples(cmd),
+            topic_for(cmd),
+        ]
         for section, commands in group_commands(router.commands).items()
         for cmd in commands
     ]

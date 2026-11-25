@@ -14,9 +14,9 @@
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body { margin: 0; min-height: 100vh; background: var(--paper); }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button { cursor: pointer; }
-button:focus-visible, input:focus-visible { outline: 3px solid var(--green); outline-offset: 3px; }
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 3px solid var(--green); outline-offset: 3px; }
 .shell { width: min(1120px, calc(100% - 44px)); margin: 0 auto; padding: 30px 0 60px; }
 .masthead {
   position: relative; border-block: 7px solid var(--ink); border-bottom-width: 2px;
@@ -37,14 +37,14 @@ h1 { margin: 16px 0; font-size: clamp(2.8rem, 6.5vw, 4.8rem); letter-spacing: -.
 .view-tabs { display: flex; gap: 4px; margin: 23px 0 15px; padding: 4px; width: fit-content; border: 1px solid var(--rule); border-radius: 10px; background: #e7eadf; }
 .view-tab, .kind-button { border: 0; padding: 9px 18px; min-height: 42px; border-radius: 6px; color: var(--muted); background: transparent; font-weight: 700; }
 .view-tab.active, .kind-button.active { color: white; background: var(--green); }
-.view-pane[hidden], .card.hidden, .group.hidden, .empty, .load-more[hidden] { display: none; }
+.view-pane[hidden], .empty, .load-more[hidden], .command-pages[hidden] { display: none; }
 .controls { position: sticky; top: 0; z-index: 3; padding: 10px 0; background: var(--paper); border-bottom: 1px solid var(--rule); }
 .search-wrap { display: block; position: relative; }
 .search-wrap::before { content: ""; position: absolute; left: 15px; top: 14px; width: 13px; height: 13px; border: 2px solid var(--muted); border-radius: 50%; }
 .search-wrap::after { content: ""; position: absolute; left: 29px; top: 29px; width: 7px; height: 2px; background: var(--muted); transform: rotate(45deg); }
 .search-input { width: 100%; min-height: 47px; padding: 9px 13px 9px 47px; border: 1px solid #a2b3a8; border-radius: 8px; color: var(--ink); background: var(--panel); }
 .filters, .kind-switch { display: flex; gap: 6px; }
-.filters { overflow-x: auto; padding: 10px 0 5px; scrollbar-width: thin; }
+.filters { flex-wrap: wrap; padding: 10px 0 5px; }
 .filter, .copy { padding: 6px 11px; border: 1px solid var(--rule); border-radius: 7px; color: var(--green); background: var(--panel); }
 .filter { flex: none; }
 .filter.active { border-color: var(--ink); color: var(--paper); background: var(--ink); }
@@ -54,14 +54,23 @@ h2 { margin: 0; font-size: clamp(1.35rem, 3vw, 1.8rem); line-height: 1.35; }
 .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .card { position: relative; min-width: 0; padding: 19px; border: 1px solid var(--rule); border-radius: 12px; background: var(--panel); }
 .card:hover, .asset-card:hover { border-color: var(--green); }
-.topline { float: right; margin: 0 0 5px 8px; }
-.copy { font-size: .85rem; }
+.sample-line { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.copy { flex: none; min-height: 34px; font-size: .9rem; }
 .copy:hover { background: var(--mint); }
-.command { display: inline-block; max-width: 100%; margin: 0 0 11px; padding: 3px 8px; border-radius: 4px; background: #ffebad; color: var(--ink); font: 700 1.06rem/1.5 "IBM Plex Mono", ui-monospace, monospace; overflow-wrap: anywhere; }
+.command { display: inline-block; min-width: 0; max-width: 100%; margin: 0 0 9px; padding: 3px 8px; border-radius: 4px; background: #ffebad; color: var(--ink); font: 700 1.06rem/1.5 "IBM Plex Mono", ui-monospace, monospace; overflow-wrap: anywhere; }
 .desc, .example, .collection-title p, .collection-note, footer { line-height: 1.65; }
 .desc { margin: 0; }
+.command-key { margin: 0 0 5px; color: var(--muted); font-size: .9rem; }
 .example { margin: 7px 0 0; color: var(--muted); font-size: .88rem; overflow-wrap: anywhere; }
 .example b, footer strong, .asset-id { color: var(--green); }
+.command-details { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--rule); }
+.command-details summary { width: fit-content; padding-block: 4px; color: var(--green); font-size: .92rem; font-weight: 700; cursor: pointer; }
+.extra-sample { margin-top: 10px; }
+.extra-sample .command { font-weight: 600; font-size: .96rem; background: #edf3e8; margin: 0; }
+.extra-sample .example { margin: 3px 0 0; }
+.command-pages { display: flex; gap: 15px; justify-content: center; align-items: center; margin: 22px 0; color: var(--muted); }
+.command-pages button, #reset-search { border: 1px solid var(--rule); border-radius: 6px; padding: 8px 12px; background: var(--panel); color: var(--green); }
+.command-pages button:disabled { opacity: .46; cursor: default; }
 .empty.show { display: block; padding: 38px 15px; text-align: center; color: var(--muted); border: 1px dashed var(--rule); border-radius: 10px; }
 .collection-panel { margin-top: 22px; padding: 22px; border: 1px solid var(--rule); border-radius: 14px; background: var(--panel); }
 .collection-title, .asset-toolbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
@@ -105,5 +114,14 @@ footer { margin-top: 42px; padding-top: 20px; border-top: 2px solid var(--ink); 
 }
 @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
 
-.topic-filter { display: inline-flex; align-items: center; gap: 7px; margin-top: 3px; color: var(--muted); font-size: .88rem; }
-.topic-filter select { padding: 3px 6px; color: var(--ink); border: 1px solid var(--rule); border-radius: 5px; background: var(--panel); }
+.filter-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px; margin-top: 5px; color: var(--muted); font-size: .9rem; }
+.filter-tools select { padding: 5px; max-width: 100%; color: var(--ink); border: 1px solid var(--rule); border-radius: 5px; background: var(--panel); }
+.filter-tools .result-count { margin-left: auto; }
+.category-select { display: none; }
+@media (max-width: 620px) {
+  .filters { display: none; }
+  .category-select { display: inline; }
+  .filter-tools { gap: 5px 10px; margin-top: 8px; }
+  .filter-tools select { max-width: 9em; }
+  .copy { min-height: 40px; }
+}

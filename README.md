@@ -330,4 +330,4 @@ Shell，也不能执行任意远程命令。工作流需要以下 Actions Secret
 - QQ 官方机器人能否进入普通群、可回复频率和消息类型受开放平台审核、权限和限流约束。
 
 
-更新命令或别名后，运行 `.venv/bin/python scripts/sync_help_site.py` 同步本地帮助网页。`.venv/bin/python scripts/sync_help_site.py --check` 可检查网页清单是否与机器人注册的命令一致。网页目录位于 `bot-homepage/dist/`。
+更新命令、分区或使用示例后，运行 `.venv/bin/python scripts/sync_help_site.py` 更新 `bot-homepage/dist/`，再用 `.venv/bin/python scripts/sync_help_site.py --check` 核对网页与 QQ 菜单。发布时将改动推送到 GitHub 的 `main` 来更新云端 Bot，并将同一提交的 `bot-homepage/dist/` 发布到 `bot-homepage/.openai/hosting.json` 指定的原 Sites 项目。群友保存的主页链接和收藏品图鉴链接可继续使用。

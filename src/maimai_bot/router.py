@@ -7,7 +7,14 @@ from dataclasses import dataclass
 from re import Pattern
 
 from .domain import BotReply, CommandRequest, MessageContext
-from .help_catalog import group_commands, select_group
+from .help_catalog import (
+    command_examples,
+    command_usage,
+    group_commands,
+    select_group,
+    topic_links,
+    topic_names,
+)
 
 Reply = str | BotReply
 Handler = Callable[[CommandRequest], Awaitable[Reply]]
@@ -158,23 +165,32 @@ class CommandRouter:
         """Registered commands, in registration order, for transport UI adapters."""
         return tuple(self._commands.values())
 
+    def help_command_info(self, query: str) -> CommandInfo | None:
+        return self._lookup.get(query.strip().lstrip("/").casefold())
+
     def help_text(self, category: str = "") -> str:
         groups = group_commands(self.commands)
-        if category:
-            title, items = select_group(self.commands, category)
-            if not items:
-                available = dict.fromkeys((*groups, *group_commands(self.commands, legacy=True)))
-                return "可查看的帮助分类有 " + "、".join(available)
-            groups = {title: items}
-        lines = ["柚子指令帮助（/ 可省略）"]
-        for title, items in groups.items():
-            lines.append(f"\n【{title}】")
-            for item in items:
-                example = item.usage or f"/{item.name}"
-                lines.append(f"{example} — {item.description}")
         if not category:
-            lines.append("\n发送 /help 分类名查看一类指令，或发送 帮助maimaiDX 查看舞萌目录。")
-        lines.append("直接 @机器人 说话可进入对话。")
+            lines = ["柚子指令目录"]
+            for name, items in groups.items():
+                topics = topic_names(name, items)
+                suffix = "　" + "、".join(topics) if topics else ""
+                lines.append(f"/help {name}{suffix}")
+            lines.append("发送 /help 文字 舞萌 成绩 查分区，或发 /help 文字 pc50 查一条指令。")
+            return "\n".join(lines)
+        title, items = select_group(self.commands, category)
+        if not items:
+            command = self.help_command_info(category)
+            if command:
+                lines = [f"/{command.name} — {command.description}"]
+                lines.extend(f"{example} — {purpose}" for example, purpose in command_examples(command))
+                return "\n".join(lines)
+            available = dict.fromkeys((*groups, *group_commands(self.commands, legacy=True)))
+            return "可查看的帮助分类有 " + "、".join(available) + "。也可发送 /help 指令名。"
+        lines = [f"【{title}】", *topic_links(title, items)]
+        for item in items:
+            lines.append(f"{command_usage(item)} — {item.description}")
+        lines.append("发送 /help 指令名 查看可复制的用法，例如 /help pc50。")
         return "\n".join(lines)
 
 

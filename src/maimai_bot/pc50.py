@@ -315,7 +315,7 @@ def register_pc50(router, scores, catalog, cosmetics, images, community):
         "按逐谱游玩次数绘制个人 Top 50，支持导入游戏成绩 JSON",
         aliases=("游玩排行50",),
         category="成绩",
-        usage="/pc50 · /pc50 导入",
+        usage="/pc50 [导入|取消|清除]",
     )
     async def pc50(req):
         try:

@@ -278,11 +278,14 @@ class B50ImageService:
         except Exception as exc:
             raise B50RenderError(f"生成每日推歌图片失败：{exc}") from exc
 
-    def render_help(self, commands: tuple[Any, ...], *, title: str = "柚子菜单", legacy: bool = False) -> bytes:
+    def render_help(
+        self, commands: tuple[Any, ...], *, title: str = "柚子菜单",
+        legacy: bool = False, by_topic: bool = False,
+    ) -> bytes:
         """Render the complete command list for clients that cannot open the web help."""
         try:
             from .academy import draw_menu
-            return draw_menu(commands, title=title, legacy=legacy)
+            return draw_menu(commands, title=title, legacy=legacy, by_topic=by_topic)
         except Exception as exc:
             raise B50RenderError(f"生成帮助菜单图片失败：{exc}") from exc
 

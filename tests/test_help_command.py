@@ -55,3 +55,64 @@ def test_cosmetic_help_links_to_searchable_catalog() -> None:
 
     assert COSMETIC_SITE_URL in text
     assert "点击复制 ID" in text
+
+
+def _complete_router(images=None):
+    from maimai_bot.services.lxns_scores import ScoreSources
+
+    unused = object()
+    return build_router(
+        unused,
+        ScoreSources(unused, unused),
+        images or HelpImageStub(),
+        unused,
+        unused,
+        unused,
+        unused,
+        recognition=unused,
+        community=unused,
+        cross_games=unused,
+        group_life=unused,
+    )
+
+
+async def test_section_topic_and_individual_help_cover_recent_commands():
+    router = _complete_router()
+    for query, required in (
+        ("舞萌/成绩", ["/pc50", "/scoretable", "/b50"]),
+        ("maimaiDX 牌子", ["镜将进度", "彩将进度", "/plate-conditions"]),
+        ("礼物工坊 · 合成", ["/合成", "/一键合成", "/合成状态"]),
+        ("管理 群设置", ["/群聊设置", "/发言频次", "/群戳频次"]),
+    ):
+        result = await router.dispatch(_context("/help 文字 " + query))
+        assert isinstance(result, str) and all(term in result for term in required)
+    index = await router.dispatch(_context("/help 文字"))
+    assert isinstance(index, str) and "/help 舞萌" in index and "群设置" in index
+    reply = await router.dispatch(_context("/help 游玩排行50"))
+    assert isinstance(reply, BotReply) and reply.image_png.startswith(b"\x89PNG")
+    assert reply.followup_text.splitlines() == ["/pc50", "/pc50 导入", "/pc50 取消", "/pc50 清除"]
+    assert "3 分钟" in reply.text and "快照" in reply.text
+    plate = await router.dispatch(_context("/help 文字 plate"))
+    assert isinstance(plate, str) and "彩将进度" in plate and "霸进度" in plate
+
+
+def test_registered_commands_have_sendable_examples_and_discoverable_topics():
+    from maimai_bot.help_catalog import (
+        command_examples,
+        command_usage,
+        group_commands,
+        group_topics,
+        select_group,
+    )
+
+    router = _complete_router()
+    groups = group_commands(router.commands)
+    for section, commands in groups.items():
+        for topic, children in group_topics(commands).items():
+            for item in children:
+                assert item in select_group(router.commands, f"{section} {topic}")[1]
+        for command in commands:
+            assert command_usage(command).startswith("/" + command.name)
+            for example, meaning in command_examples(command):
+                assert meaning and router.recognizes_command(example.removeprefix("/"))
+                assert "[" not in example and " 或 " not in example

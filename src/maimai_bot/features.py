@@ -17,7 +17,7 @@ from .community_commands import register_community
 from .cross_game import CrossGameService, register_cross_game
 from .domain import BotReply, CommandRequest, MessageContext, QuickAction
 from .group_life import GroupLife, register_group_commands
-from .help_catalog import group_commands, select_group
+from .help_catalog import command_examples, command_usage, group_commands, select_group, topic_links
 from .lxns_commands import register_source_commands
 from .party_games import register_party_games
 from .pc50 import register_pc50
@@ -221,30 +221,41 @@ def build_router(
     )
     async def help_command(request: CommandRequest) -> str | BotReply:
         if request.argument:
-            category = request.argument.removeprefix("文字 ").strip()
-            text = router.help_text(category)
-            if request.argument.startswith("文字 "):
-                return text
-            category, items = select_group(router.commands, category)
+            query = request.argument
+            if query == "文字" or query.startswith("文字 "):
+                return router.help_text(query.removeprefix("文字").strip())
+            category, items = select_group(router.commands, query)
+            text = router.help_text(query)
             if not items:
-                return text
+                detail = router.help_command_info(query)
+                if not detail:
+                    return text
+                examples = command_examples(detail)
+                return await academy_card(
+                    f"/{detail.name}", examples, section="指令用法", note=detail.description,
+                    followup="\n".join(example for example, _ in examples),
+                )
+            topics = topic_links(category, items)
+            tips = [*topics, f"发送 /help 文字 {query} 可查看文字版。"]
             if len(items) > 16:
                 try:
                     image_png = await asyncio.to_thread(
-                        b50_images.render_help, tuple(items), title=f"{category}指令", legacy=True
+                        b50_images.render_help, tuple(items), title=f"{category}指令",
+                        legacy=not topics, by_topic=bool(topics),
                     )
                 except B50RenderError:
                     return text
-                return BotReply(text=text, image_png=image_png, followup_text=f"发送 /help 文字 {category} 可复制各条指令。")
+                return BotReply(text=text, image_png=image_png, followup_text="\n".join(tips))
             return await academy_card(
-                f"{category}指令", [(item.usage or f"/{item.name}", item.description) for item in items],
-                section="帮助", followup="\n".join(item.usage or f"/{item.name}" for item in items),
+                f"{category}指令", [(command_usage(item), item.description) for item in items],
+                section="帮助", note="发送 /help 指令名 查看所有用法和可复制示例。",
+                followup="\n".join([*(command_examples(item)[0][0] for item in items), *tips]),
             )
         site_message = (
             "柚子把完整指令整理成主页啦：\n"
             f"{HELP_SITE_URL}\n\n"
             "如果页面无法打开，请先开启网络代理后重试。"
-            "主页支持搜索、分类和一键复制。发送 帮助maimaiDX 可打开舞萌目录，/help 文字 成绩 可看文字版。"
+            "主页支持搜索、分类和一键复制。在 QQ 发送 帮助maimaiDX 直达舞萌，/help pc50 查看用法，/help 文字 打开文字目录。"
         )
         try:
             image_png = await asyncio.to_thread(b50_images.render_help, router.commands)
@@ -966,7 +977,7 @@ def build_router(
         )
 
     @router.command(
-        "plate", "查询版本牌子完成情况", category="牌子", usage="橙将 / 橙将进度 / 舞进度"
+        "plate", "查询版本牌子完成情况", category="牌子", usage="橙将进度 / 镜将进度 / 彩将进度"
     )
     async def plate_command(request: CommandRequest) -> str | BotReply:
         plate = request.argument.removesuffix("完成表").removesuffix("进度").strip()

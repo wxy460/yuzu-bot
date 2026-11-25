@@ -10,7 +10,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw
 
-from ..help_catalog import group_commands
+from ..help_catalog import command_usage, group_commands, group_topics, topic_names
 from .b50_image import _font
 from .result_card import _wrap
 
@@ -209,34 +209,40 @@ def draw_card(title, rows, section, metric, note) -> bytes:
     return _png(im)
 
 
-def draw_menu(commands: Sequence[Any], *, title="柚子菜单", legacy=False) -> bytes:
-    sections = group_commands(commands, legacy=legacy)
+def draw_menu(commands: Sequence[Any], *, title="柚子菜单", legacy=False, by_topic=False) -> bytes:
+    sections = group_topics(commands) if by_topic else group_commands(commands, legacy=legacy)
     blocks = []
     for category, items in sections.items():
         pairs = []
         for offset in range(0, len(items), 2):
             pair = []
             for c in items[offset : offset + 2]:
-                usage = _wrap(c.usage or f"/{c.name}", 30, 690, True)
+                usage = _wrap(command_usage(c), 30, 690, True)
                 desc = _wrap(c.description, 24, 690)
                 pair.append((usage, desc))
             height = max(42 * len(u) + 34 * len(t) for u, t in pair) + 44
             pairs.append((pair, height))
-        blocks.append((category, pairs))
+        topics = "、".join(topic_names(category, items)) if not by_topic and not legacy else ""
+        blocks.append((category, pairs, topics))
     header_h = round(1.35 * (124 + 65 * len(_wrap(title, 65, 1219, bold=True))))
-    height = header_h + 44 + sum(94 + sum(h for _, h in pairs) for _, pairs in blocks) + 100
+    height = (
+        header_h
+        + 44
+        + sum(94 + (43 if topics else 0) + sum(h for _, h in pairs) for _, pairs, topics in blocks)
+        + 100
+    )
     im = Image.new("RGB", (1600, height), PAPER)
     y = draw_header(im, title, "指令手册", 1.35)
     d = ImageDraw.Draw(im)
     d.text(
         (54, y + 1),
-        "发送 /help 分类名 查看分组，或发送 帮助maimaiDX 直达舞萌。",
+        "/help 舞萌 成绩 查看分类　·　/help pc50 查看完整用法　·　/help 文字 打开文字目录",
         font=_font(27),
         fill=MUTED,
         anchor="lt",
     )
     y += 60
-    for category, pairs in blocks:
+    for category, pairs, topics in blocks:
         d.rounded_rectangle((54, y, 1546, y + 58), radius=10, fill=INK)
         d.rectangle((54, y + 11, 62, y + 47), fill=YELLOW)
         d.text((78, y + 12), category, font=_font(32, bold=True), fill=PAPER, anchor="lt")
@@ -248,6 +254,9 @@ def draw_menu(commands: Sequence[Any], *, title="柚子菜单", legacy=False) ->
             anchor="rt",
         )
         y += 73
+        if topics:
+            d.text((78, y), f"子分类　{topics}", font=_font(26), fill=GREEN, anchor="lt")
+            y += 43
         for pair, h in pairs:
             for col, (usage, desc) in enumerate(pair):
                 x = 54 + col * 752
